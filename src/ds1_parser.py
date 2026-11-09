@@ -25,6 +25,8 @@ class FlightOffer:
     stops: str = "Directo"
     duration: str = "N/A"
     dep_arr: str = ""
+    origin_airport: Optional[str] = None
+    destination_airport: Optional[str] = None
     is_self_transfer: bool = False
     tab_source: str = "best"  # "best" or "cheapest"
 
@@ -247,17 +249,27 @@ def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optio
     stop_count = max(0, len(legs) - 1) if legs else 0
     stops_str = format_stops_label(stop_count)
 
-    # Departure & arrival time string from first and last leg
+    # Departure & arrival time string and winning IATA airport codes from first and last leg
     dep_arr_str = ""
+    dep_iata_clean: Optional[str] = None
+    arr_iata_clean: Optional[str] = None
     if legs:
         first_leg = legs[0]
         last_leg = legs[-1]
         dep_time = _format_time_tuple(_safe_get(first_leg, 8))
         arr_time = _format_time_tuple(_safe_get(last_leg, 10))
-        dep_iata = _safe_get(first_leg, 3) or ""
-        arr_iata = _safe_get(last_leg, 6) or ""
+        raw_dep_iata = _safe_get(first_leg, 3) or _safe_get(core, 3) or ""
+        raw_arr_iata = _safe_get(last_leg, 6) or _safe_get(core, 6) or ""
+        if isinstance(raw_dep_iata, str) and re.match(r"^[A-Z]{3}$", raw_dep_iata.strip().upper()):
+            dep_iata_clean = raw_dep_iata.strip().upper()
+        if isinstance(raw_arr_iata, str) and re.match(r"^[A-Z]{3}$", raw_arr_iata.strip().upper()):
+            arr_iata_clean = raw_arr_iata.strip().upper()
         if dep_time and arr_time:
-            route_suffix = f" ({dep_iata}-{arr_iata})" if dep_iata and arr_iata else ""
+            route_suffix = (
+                f" ({dep_iata_clean}-{arr_iata_clean})"
+                if dep_iata_clean and arr_iata_clean
+                else ""
+            )
             dep_arr_str = f"{dep_time} - {arr_time}{route_suffix}"
 
     # Check self-transfer indicators in entry JSON dump
@@ -270,6 +282,8 @@ def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optio
         stops=stops_str,
         duration=duration_str,
         dep_arr=dep_arr_str,
+        origin_airport=dep_iata_clean,
+        destination_airport=arr_iata_clean,
         is_self_transfer=is_self_transfer,
         tab_source=tab_source,
     )
@@ -390,9 +404,19 @@ def parse_shopping_rpc_response(raw_body: str) -> list[FlightOffer]:
 
 
 PRICE_PATTERNS = (
-    # e.g. "Desde 14,520 pesos mexicanos", "14,520 MXN", "$14,520", "MX$14,520"
+    # Explicit currency prefix ($14,520, MX$14,520, Desde 14,520)
     re.compile(
-        r"(?:MX\$|US\$|\$|Desde\s+)?(\d{1,3}(?:[.,\s]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|pesos|dólares)?",
+        r"(?:MX\$|US\$|\$|EUR|€|Desde\s+)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
+        re.IGNORECASE,
+    ),
+    # Explicit currency suffix (14,520 MXN, 31.295 MXN, 14520 pesos)
+    re.compile(
+        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|pesos|dólares)",
+        re.IGNORECASE,
+    ),
+    # Formatted thousands with comma or dot (31.295, 14,520) not followed by non-price units
+    re.compile(
+        r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+)(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas|stops))",
         re.IGNORECASE,
     ),
 )
@@ -418,6 +442,92 @@ AIRLINE_ARIA_PATTERNS = (
     # English Google Flights aria-label: "Flight with Iberia." or "with American Airlines."
     re.compile(r"(?:Flight\s+with|with)\s+([A-Za-z0-9\s,&/-]{2,40}?)(?:\.|,|;|\s+Leaves|\s+Nonstop|\s+\d+\s+stop)", re.IGNORECASE),
 )
+
+NON_AIRPORT_THREE_LETTER_TOKENS: set[str] = {
+    "MXN", "USD", "EUR", "CAD", "COP", "GBP", "JPY", "BRL", "CLP", "ARS", "PEN",
+    "HRS", "MIN", "SEG", " NON", "DIR", "CON", "POR", "DEL", "LAS", "LOS", "UNA",
+    "DOS", "MAS", "MÁS", "VER", "IDA", "MES", "DIA", "DÍA", "AÑO", "UTC", "GMT",
+}
+
+AIRPORT_NAME_FALLBACK_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("felipe ángeles", "NLU"),
+    ("felipe angeles", "NLU"),
+    ("santa lucía", "NLU"),
+    ("benito juárez", "MEX"),
+    ("benito juarez", "MEX"),
+    ("toluca", "TLC"),
+    ("narita", "NRT"),
+    ("haneda", "HND"),
+    ("barajas", "MAD"),
+    ("el prat", "BCN"),
+    ("charles de gaulle", "CDG"),
+    ("orly", "ORY"),
+    ("heathrow", "LHR"),
+    ("gatwick", "LGW"),
+    ("stansted", "STN"),
+    ("luton", "LTN"),
+    ("john f. kennedy", "JFK"),
+    ("newark", "EWR"),
+    ("laguardia", "LGA"),
+    ("fiumicino", "FCO"),
+    ("ciampino", "CIA"),
+    ("malpensa", "MXP"),
+    ("linate", "LIN"),
+    ("incheon", "ICN"),
+    ("gimpo", "GMP"),
+    ("ezeiza", "EZE"),
+    ("aeroparque", "AEP"),
+    ("guarulhos", "GRU"),
+    ("congonhas", "CGH"),
+    ("viracopos", "VCP"),
+)
+
+ROUTE_HYPHEN_RE = re.compile(r"\b([A-Z]{3})\s*[-–—➔→]\s*([A-Z]{3})\b")
+
+
+def extract_route_iatas_from_card(
+    aria_label: str,
+    inner_text: str,
+    dep_arr: str = "",
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract the specific departure and arrival IATA airport codes (`origin_airport`, `destination_airport`)
+    from a Google Flights DOM card (`inner_text` and `aria-label`).
+    """
+    # 1. Explicit hyphenated pair in inner_text or dep_arr (e.g. "NLU–NRT", "MEX - HND")
+    for source_text in (inner_text or "", dep_arr or "", aria_label or ""):
+        for match in ROUTE_HYPHEN_RE.finditer(source_text):
+            c1, c2 = match.group(1).upper(), match.group(2).upper()
+            if c1 not in NON_AIRPORT_THREE_LETTER_TOKENS and c2 not in NON_AIRPORT_THREE_LETTER_TOKENS:
+                return c1, c2
+
+    # 2. Standalone 3-letter IATA lines in inner_text (when Google Flights renders multi-airport highlight spans)
+    if inner_text:
+        lines = [ln.strip() for ln in inner_text.splitlines() if ln.strip()]
+        standalone_iatas: list[str] = []
+        for ln in lines:
+            if re.match(r"^[A-Z]{3}$", ln) and ln not in NON_AIRPORT_THREE_LETTER_TOKENS:
+                standalone_iatas.append(ln)
+        if len(standalone_iatas) >= 2:
+            return standalone_iatas[0], standalone_iatas[-1]
+
+    # 3. Fallback: Airport full names in Spanish/English aria-label (e.g. "Sale del Aeropuerto... Felipe Ángeles y llega al... Narita")
+    if aria_label:
+        lower_aria = aria_label.lower()
+        found_by_pos: list[tuple[int, str]] = []
+        for keyword, iata_code in AIRPORT_NAME_FALLBACK_KEYWORDS:
+            pos = lower_aria.find(keyword)
+            if pos != -1:
+                found_by_pos.append((pos, iata_code))
+        found_by_pos.sort(key=lambda x: x[0])
+        dedup_iatas: list[str] = []
+        for _, code in found_by_pos:
+            if code not in dedup_iatas:
+                dedup_iatas.append(code)
+        if len(dedup_iatas) >= 2:
+            return dedup_iatas[0], dedup_iatas[1]
+
+    return None, None
 
 
 def parse_price_number(raw_price_text: str) -> Optional[float]:
@@ -496,17 +606,36 @@ def parse_flight_card_text(
         # Look for airline line in visible inner_text (typically the line right after departure/arrival times)
         lines = [ln.strip() for ln in inner_text.splitlines() if ln.strip()]
         for ln in lines:
-            if len(ln) < 2 or len(ln) > 45:
+            if len(ln) < 2:
                 continue
-            if re.search(r"\d{1,2}:\d{2}|\$|MXN|USD|Directo|escala|stop|\d+\s*h\b|CO2|emisiones", ln, re.I):
+            # Strip codeshare / operator suffixes e.g. "Iberia, FinnairOperado por ..."
+            cleaned_airline = re.split(r"(?:Operado por|Operated by)\b", ln, flags=re.I)[0].strip(" .,;-")
+            if len(cleaned_airline) < 2 or len(cleaned_airline) > 65:
                 continue
-            if re.match(r"^[A-Z]{3}\s*[-–]\s*[A-Z]{3}$", ln):
+            if re.search(
+                r"\d{1,2}:\d{2}|\$|MXN|USD|EUR|Directo|escala|stop|\d+\s*h\b|CO2|emisiones|árboles|ida y vuelta|round trip",
+                cleaned_airline,
+                re.I,
+            ):
                 continue
-            airline = ln
+            if re.match(r"^[A-Z]{3}\s*[-–—➔→]\s*[A-Z]{3}$", cleaned_airline):
+                continue
+            # Skip comma-separated lists of 3-letter layover airport codes (e.g. "MAD, HEL" or "DFW, HEL, RVN")
+            if re.match(r"^[A-Z]{3}(?:\s*,\s*[A-Z]{3})+$", cleaned_airline):
+                continue
+            airline = cleaned_airline
             break
 
     if not airline:
         airline = "Aerolínea"
+
+    orig_iata, dest_iata = extract_route_iatas_from_card(
+        aria_label=aria_label,
+        inner_text=inner_text,
+        dep_arr=dep_arr,
+    )
+    if orig_iata and dest_iata and dep_arr and f"({orig_iata}-{dest_iata})" not in dep_arr:
+        dep_arr = f"{dep_arr} ({orig_iata}-{dest_iata})"
 
     is_self_transfer = detect_self_transfer(combined)
 
@@ -516,6 +645,8 @@ def parse_flight_card_text(
         stops=stops[:30],
         duration=duration[:30],
         dep_arr=dep_arr[:50],
+        origin_airport=orig_iata,
+        destination_airport=dest_iata,
         is_self_transfer=is_self_transfer,
         tab_source=tab_source,
     )

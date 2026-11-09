@@ -14,6 +14,7 @@ Features:
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import hmac
 from typing import Any, Optional
@@ -35,6 +36,8 @@ from src.config import (
     MAX_SLOTS_PER_DESTINATION,
     MAX_TOTAL_SLOTS,
     get_flight_window_status,
+    get_proxy_pool,
+    test_proxy_connection,
 )
 from src.db import (
     bulk_create_date_slots,
@@ -55,8 +58,11 @@ from src.runner import run_sharded_dispatcher
 from src.tfs_builder import (
     FilterProfile,
     build_google_flights_url,
+    format_corridor_display,
     format_date_slot_label,
     generate_date_matrix,
+    normalize_iata_codes,
+    parse_iata_list,
     parse_pasted_urls,
 )
 
@@ -311,7 +317,9 @@ def render_top_metrics_ribbon(summary: dict[str, Any]) -> None:
         if best_deal and best_deal.get("latest_cheapest_price") is not None:
             price = float(best_deal["latest_cheapest_price"])
             curr = best_deal.get("currency", DEFAULT_CURRENCY)
-            route = f"{best_deal.get('origin')} ➔ {best_deal.get('destination_code')}"
+            win_orig = best_deal.get("latest_origin_airport") or best_deal.get("origin")
+            win_dest = best_deal.get("latest_destination_airport") or best_deal.get("destination_code")
+            route = f"{win_orig} ➔ {win_dest}"
             label_str = best_deal.get("label") or best_deal.get("outbound_date")
             st.metric(
                 label="Mejor Tarifa Global Hoy",
@@ -351,10 +359,11 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
 
     dest_options: list[tuple[Optional[int], str]] = []
     for d in destinations:
+        corridor_lbl = format_corridor_display(d["origin"], d["destination"])
         dest_options.append(
             (
                 int(d["id"]),
-                f"[{'Activo' if d.get('is_active') else 'Pausado'}] {d['name']} ({d['origin']} ➔ {d['destination']}) — "
+                f"[{'Activo' if d.get('is_active') else 'Pausado'}] {d['name']} ({corridor_lbl}) — "
                 f"{d.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION} fechas | Meta: ${float(d['target_price']):,.0f} {d['currency']}",
             )
         )
@@ -376,7 +385,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
     )
 
     # --------------------------------------------------------------------------
-    # CORRIDOR HEADER HERO BANNER
+    # CORRIDOR HEADER HERO BANNER (MULTI-AIRPORT BADGE PILLS)
     # --------------------------------------------------------------------------
     if selected_dest:
         f_cfg = FilterProfile.from_dict(selected_dest.get("filter_config"))
@@ -391,14 +400,25 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         bags_txt = f"{f_cfg.carry_on_bags} maleta(s)" if f_cfg.carry_on_bags > 0 else "Sin filtro equipaje"
         hours_txt = f"{f_cfg.dep_start_hour:02d}:00–{f_cfg.dep_end_hour:02d}:59"
 
+        orig_badges_html = " ".join(
+            f'<span class="corridor-iata">{code.strip()}</span>'
+            for code in str(selected_dest["origin"]).split(",")
+            if code.strip()
+        )
+        dest_badges_html = " ".join(
+            f'<span class="corridor-iata">{code.strip()}</span>'
+            for code in str(selected_dest["destination"]).split(",")
+            if code.strip()
+        )
+
         st.markdown(
             f"""
             <div class="corridor-banner">
                 <div>
-                    <div class="corridor-codes">
-                        <span class="corridor-iata">{selected_dest['origin']}</span>
+                    <div class="corridor-codes" style="flex-wrap: wrap;">
+                        {orig_badges_html}
                         <span style="color: #64748B;">➔</span>
-                        <span class="corridor-iata">{selected_dest['destination']}</span>
+                        {dest_badges_html}
                         <span style="font-size: 1.15rem; color: #E2E8F0; margin-left: 8px;">{selected_dest['name']}</span>
                     </div>
                     <div style="margin-top: 8px; font-size: 0.88rem; color: #94A3B8;">
@@ -424,7 +444,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         return
 
     # --------------------------------------------------------------------------
-    # 10-DATE COMPARISON MATRIX TABLE (WITH 330-DAY WINDOW VERIFICATION)
+    # 10-DATE COMPARISON MATRIX TABLE (WITH WINNING ROUTE & 330-DAY VERIFICATION)
     # --------------------------------------------------------------------------
     st.markdown("### Comparativa de Fechas (Más Baratos vs. Mejores Vuelos)")
 
@@ -433,8 +453,9 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         out_d = s.get("outbound_date") or ""
         ret_d = s.get("return_date")
         date_pair_label = s.get("label") or (f"{out_d} ➔ {ret_d}" if ret_d else f"{out_d} (Solo ida)")
+        corridor_fallback = format_corridor_display(s.get("origin") or "MEX", s.get("destination_code") or "MAD")
         if selected_dest_id is None:
-            date_pair_label = f"[{s.get('origin')}➔{s.get('destination_code')}] {date_pair_label}"
+            date_pair_label = f"{corridor_fallback} • {date_pair_label}"
 
         c_price = s.get("latest_cheapest_price")
         b_price = s.get("latest_best_price")
@@ -442,12 +463,22 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         target_p = float(s.get("target_price") or 0.0)
         curr = s.get("currency") or DEFAULT_CURRENCY
 
-        win_info = s.get("window_info") or get_flight_window_status(out_d)
+        win_orig = s.get("latest_origin_airport")
+        win_dest = s.get("latest_destination_airport")
+        if win_orig and win_dest:
+            winning_route_str = f"{win_orig} ➔ {win_dest}"
+        elif "," not in str(s.get("origin") or "") and "," not in str(s.get("destination_code") or ""):
+            winning_route_str = f"{s.get('origin')} ➔ {s.get('destination_code')}"
+        else:
+            winning_route_str = corridor_fallback
+
+        win_info = s.get("window_info") or get_flight_window_status(out_d, ret_d)
         is_future = win_info.get("status") == "FUTURE_RELEASE"
 
         # Format price and spread
+        rel_date_obj = win_info.get("release_date")
         if is_future:
-            c_price_fmt = f"Libera el {win_info['release_date'].strftime('%d/%m/%Y')}" if win_info.get("release_date") else "Fuera de ventana"
+            c_price_fmt = f"Libera el {rel_date_obj.strftime('%d/%m/%Y')}" if rel_date_obj else "Fuera de ventana"
             b_price_fmt = "—"
             spread_fmt = "—"
             atl_fmt = "—"
@@ -455,14 +486,16 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
             airline_stops_str = "En espera de publicación por aerolíneas"
             dur_str = "—"
         elif c_price is not None:
-            c_price_fmt = f"${c_price:,.0f} {curr}"
-            b_price_fmt = f"${b_price:,.0f} {curr}" if b_price is not None else "—"
-            spread = (b_price - c_price) if (b_price is not None and c_price is not None) else None
+            c_price_float = float(c_price)
+            b_price_float = float(b_price) if b_price is not None else None
+            c_price_fmt = f"${c_price_float:,.0f} {curr}"
+            b_price_fmt = f"${b_price_float:,.0f} {curr}" if b_price_float is not None else "—"
+            spread = (b_price_float - c_price_float) if b_price_float is not None else None
             spread_fmt = f"+${spread:,.0f} {curr}" if spread is not None and spread > 0 else f"$0 {curr}" if spread is not None else "—"
-            atl_fmt = f"${atl_price:,.0f} {curr}" if atl_price is not None else "—"
-            diff = c_price - target_p
+            atl_fmt = f"${float(atl_price):,.0f} {curr}" if atl_price is not None else "—"
+            diff = c_price_float - target_p
             target_diff_fmt = f"-${abs(diff):,.0f} (Bajo Meta)" if diff <= 0 else f"+${diff:,.0f} sobre meta"
-            
+
             airline = s.get("latest_airline") or "Aerolínea"
             stops = s.get("latest_stops") or "Directo"
             self_trf = " [Self-Transfer]" if s.get("latest_is_self_transfer") else ""
@@ -482,6 +515,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                 "ID": int(s["id"]),
                 "Estado": "Activo" if s.get("is_active") else "Pausado",
                 "Fecha / Tramo": date_pair_label,
+                "Ruta Ganadora": winning_route_str,
                 "Ventana (330d)": win_info.get("badge", "Dentro de ventana"),
                 "Más Baratos": c_price_fmt,
                 "Mejores Vuelos": b_price_fmt,
@@ -501,6 +535,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
     df_matrix = pd.DataFrame(matrix_rows)
     display_cols = [
         "Fecha / Tramo",
+        "Ruta Ganadora",
         "Ventana (330d)",
         "Más Baratos",
         "Mejores Vuelos",
@@ -519,6 +554,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         hide_index=True,
         column_config={
             "Fecha / Tramo": st.column_config.TextColumn("Fecha / Tramo", width="medium"),
+            "Ruta Ganadora": st.column_config.TextColumn("Ruta Ganadora", width="small"),
             "Ventana (330d)": st.column_config.TextColumn("Ventana (330d)", width="medium"),
             "Más Baratos": st.column_config.TextColumn("Más Baratos", width="small"),
             "Mejores Vuelos": st.column_config.TextColumn("Mejores Vuelos", width="small"),
@@ -530,7 +566,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
             "Último Chequeo": st.column_config.TextColumn("Último Chequeo", width="small"),
             "Google Flights": st.column_config.LinkColumn(
                 "Google Flights",
-                help="Abrir búsqueda exacta con filtros Protobuf ?tfs= en Google Flights",
+                help="Abrir búsqueda consolidada N:M con filtros Protobuf ?tfs= en Google Flights",
                 display_text="Ver en Google Flights ↗",
                 width="small",
             ),
@@ -751,7 +787,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         for s in slots:
             sc1, sc2, sc3, sc4 = st.columns([3, 1.5, 1, 1])
             with sc1:
-                win = s.get("window_info") or get_flight_window_status(s.get("outbound_date"))
+                win = s.get("window_info") or get_flight_window_status(s.get("outbound_date"), s.get("return_date"))
                 st.write(
                     f"[{'Activo' if s.get('is_active') else 'Pausado'}] **{s.get('label') or s.get('outbound_date')}** "
                     f"({win['badge']})"
@@ -816,24 +852,28 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
     existing_cfg = FilterProfile.from_dict(existing_dest.get("filter_config") if existing_dest else {})
 
     with st.form("destination_profile_form", clear_on_submit=False):
-        r1c1, r1c2, r1c3, r1c4 = st.columns([2.2, 1, 1, 1.2])
+        r1c1, r1c2, r1c3, r1c4 = st.columns([2.0, 1.2, 1.2, 1.1])
         with r1c1:
             name_val = st.text_input(
                 "Nombre del Destino / Corredor",
-                value=existing_dest["name"] if existing_dest else "CDMX -> Tokio (Otoño)",
-                placeholder="Ej. CDMX -> Tokio (Otoño)",
+                value=existing_dest["name"] if existing_dest else "CDMX Multi -> Tokio Multi (Otoño)",
+                placeholder="Ej. CDMX Multi -> Tokio (Otoño)",
             )
         with r1c2:
             origin_val = st.text_input(
-                "Origen (IATA)",
-                value=existing_dest["origin"] if existing_dest else "MEX",
-                max_chars=5,
+                "Orígenes IATA (1 o más, sep. por coma)",
+                value=existing_dest["origin"] if existing_dest else "MEX, NLU",
+                max_chars=64,
+                placeholder="Ej. MEX, NLU, TLC",
+                help="Ingresa uno o varios aeropuertos separados por coma (ej. MEX, NLU, TLC). Se consultan juntos en 1 sola llamada.",
             ).upper()
         with r1c3:
             dest_val = st.text_input(
-                "Destino (IATA)",
-                value=existing_dest["destination"] if existing_dest else "NRT",
-                max_chars=5,
+                "Destinos IATA (1 o más, sep. por coma)",
+                value=existing_dest["destination"] if existing_dest else "NRT, HND",
+                max_chars=64,
+                placeholder="Ej. NRT, HND o TYO",
+                help="Ingresa uno o varios aeropuertos (ej. NRT, HND o MAD, BCN) o códigos metropolitanos (TYO, LON, NYC, PAR).",
             ).upper()
         with r1c4:
             trip_type_val = st.selectbox(
@@ -986,11 +1026,15 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
             )
 
             try:
+                norm_orig = normalize_iata_codes(origin_val, expand_metro=True)
+                norm_dest = normalize_iata_codes(dest_val, expand_metro=True)
+                corridor_disp = format_corridor_display(norm_orig, norm_dest)
+
                 if editing_dest_id is None:
                     new_id = create_destination(
                         name=name_val,
-                        origin=origin_val,
-                        destination=dest_val,
+                        origin=norm_orig,
+                        destination=norm_dest,
                         target_price=float(target_price_val),
                         trip_type=trip_type_val,
                         currency=currency_val,
@@ -1003,7 +1047,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     )
                     st.session_state["last_created_dest_id"] = new_id
                     st.success(
-                        f"Destino **{name_val}** (`{origin_val} ➔ {dest_val}`) creado (ID #{new_id}). "
+                        f"Destino **{name_val}** (`{corridor_disp}`) creado (ID #{new_id}). "
                         "Ahora agrega hasta 10 combinaciones de fechas en el Paso 2 abajo."
                     )
                     st.rerun()
@@ -1011,8 +1055,8 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     update_destination(
                         destination_id=editing_dest_id,
                         name=name_val,
-                        origin=origin_val,
-                        destination=dest_val,
+                        origin=norm_orig,
+                        destination=norm_dest,
                         target_price=float(target_price_val),
                         trip_type=trip_type_val,
                         currency=currency_val,
@@ -1023,7 +1067,9 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                         filter_config=profile_obj.to_dict(),
                         is_active=bool(existing_dest.get("is_active", True)) if existing_dest else True,
                     )
-                    st.success(f"Perfil del destino **{name_val}** actualizado correctamente.")
+                    st.success(
+                        f"Perfil del destino **{name_val}** (`{corridor_disp}`) y sus URLs Protobuf actualizados correctamente."
+                    )
                     st.rerun()
             except Exception as exc:
                 st.error(f"No se pudo guardar el destino: {exc}")
@@ -1140,7 +1186,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 out_str = range_start.strftime("%Y-%m-%d")
                 ret_str = range_end.strftime("%Y-%m-%d") if range_end else None
                 lbl = format_date_slot_label(out_str, ret_str)
-                win_status = get_flight_window_status(out_str)
+                win_status = get_flight_window_status(out_str, ret_str)
 
                 st.markdown(f"**Combinación:** `{lbl}`")
                 if win_status["status"] == "ACTIVE_WINDOW":
@@ -1188,7 +1234,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                         s_out_str = shift_out.strftime("%Y-%m-%d")
                         s_ret_str = shift_ret.strftime("%Y-%m-%d") if shift_ret else None
                         s_lbl = format_date_slot_label(s_out_str, s_ret_str)
-                        s_win = get_flight_window_status(s_out_str)
+                        s_win = get_flight_window_status(s_out_str, s_ret_str)
                         s_url = build_google_flights_url(
                             origin=dest_origin,
                             destination=dest_code,
@@ -1227,7 +1273,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 with sc1:
                     st.markdown(f"**{s_idx + 1}.** `{slot['label']}`")
                 with sc2:
-                    win = slot.get("window_info", get_flight_window_status(slot["outbound_date"]))
+                    win = slot.get("window_info") or get_flight_window_status(slot.get("outbound_date"), slot.get("return_date"))
                     if win["status"] == "ACTIVE_WINDOW":
                         st.markdown("<span class='status-pill-emerald'>En ventana activa</span>", unsafe_allow_html=True)
                     elif win["status"] == "FUTURE_RELEASE":
@@ -1329,7 +1375,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
             st.markdown(f"**Vista Previa ({len(generated_preview)} combinaciones generadas):**")
             preview_display = []
             for g in generated_preview:
-                w_info = get_flight_window_status(g["outbound_date"])
+                w_info = get_flight_window_status(g["outbound_date"], g.get("return_date"))
                 preview_display.append({
                     "Etiqueta": g["label"],
                     "Ida": g["outbound_date"],
@@ -1397,7 +1443,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 st.markdown(f"**URLs Decodificadas ({len(parsed_url_slots)}):**")
                 display_pasted = []
                 for p in parsed_url_slots:
-                    w_info = get_flight_window_status(p["outbound_date"])
+                    w_info = get_flight_window_status(p["outbound_date"], p.get("return_date"))
                     display_pasted.append({
                         "Etiqueta": p["label"],
                         "Ida": p["outbound_date"],
@@ -1510,13 +1556,16 @@ def render_tab3_scanner_and_logs(
                 progress_bar.progress(ratio, text=f"[{done}/{total}] {message}")
 
             with st.spinner("Extrayendo tarifas en Google Flights..."):
-                run_summary = run_sharded_dispatcher(
-                    max_slots=int(batch_limit),
-                    force_all=True,
-                    destination_id=chosen_dest_id,
-                    slot_id=chosen_slot_id,
-                    progress_callback=_ui_progress,
-                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        run_sharded_dispatcher,
+                        max_slots=int(batch_limit),
+                        force_all=True,
+                        destination_id=chosen_dest_id,
+                        slot_id=chosen_slot_id,
+                        progress_callback=_ui_progress,
+                    )
+                    run_summary = future.result()
 
             progress_bar.progress(1.0, text="Escaneo finalizado.")
             if run_summary["total_due"] == 0:
@@ -1621,6 +1670,50 @@ def render_tab3_scanner_and_logs(
             )
         else:
             st.info("Aún no se han registrado alertas disparadas en `alert_logs`.")
+
+    # --------------------------------------------------------------------------
+    # PROXY CONNECTIVITY & STEALTH DIAGNOSTICS
+    # --------------------------------------------------------------------------
+    st.markdown("---")
+    with st.expander("Diagnóstico de Proxies y Conexión de Red (Anti-Bloqueo)", expanded=False):
+        st.caption(
+            "Verifica la latencia, IP pública de salida y el estado de acceso a Google Flights "
+            "tanto para la conexión directa como para tus proxies configurados."
+        )
+        pool = get_proxy_pool()
+        active_proxies_count = len([p for p in pool if p is not None])
+        st.write(
+            f"**Pool de Proxies Detectados:** `{active_proxies_count}` configurado(s) • Conexión directa disponible como fallback."
+        )
+
+        test_col1, test_col2 = st.columns([2.5, 1])
+        with test_col1:
+            custom_proxy_test = st.text_input(
+                "Probar Proxy Personalizado (opcional)",
+                placeholder="http://user:pass@host:port o socks5://127.0.0.1:40000",
+                key="custom_proxy_test_input",
+            )
+        with test_col2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            run_proxy_check = st.button("Verificar Conexión de Red", key="btn_run_proxy_check", use_container_width=True)
+
+        if run_proxy_check:
+            targets_to_test = list(pool)
+            if custom_proxy_test.strip() and custom_proxy_test.strip() not in targets_to_test:
+                targets_to_test.append(custom_proxy_test.strip())
+
+            results_list = []
+            for target in targets_to_test:
+                with st.spinner(f"Probando {target or 'Conexión Directa'}..."):
+                    res = test_proxy_connection(target)
+                    status_desc = "Acceso Correcto (HTTP 200)" if res["success"] else f"Error: {res['error'] or 'Bloqueado'}"
+                    results_list.append({
+                        "Proxy / Red": res["proxy_url"],
+                        "IP Pública Detectada": res["ip"],
+                        "Latencia": f"{res['latency_ms']} ms",
+                        "Acceso a Google Flights": status_desc,
+                    })
+            st.dataframe(pd.DataFrame(results_list), use_container_width=True, hide_index=True)
 
 
 # ==============================================================================

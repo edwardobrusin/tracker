@@ -180,9 +180,13 @@ def run_sharded_dispatcher(
                             cheapest_stops=scrape_res.cheapest_stops,
                             cheapest_duration=scrape_res.cheapest_duration,
                             cheapest_dep_arr=scrape_res.cheapest_dep_arr,
+                            origin_airport=scrape_res.origin_airport,
+                            destination_airport=scrape_res.destination_airport,
                             best_airline=scrape_res.best_airline,
                             best_stops=scrape_res.best_stops,
                             best_duration=scrape_res.best_duration,
+                            best_origin_airport=scrape_res.best_origin_airport,
+                            best_destination_airport=scrape_res.best_destination_airport,
                             is_self_transfer=scrape_res.is_self_transfer,
                             extraction_source=scrape_res.extraction_source,
                             raw_top_offers=scrape_res.raw_top_offers,
@@ -196,6 +200,11 @@ def run_sharded_dispatcher(
                         if trigger_info is not None:
                             triggered_for_dest.append(trigger_info)
 
+                        winning_route = (
+                            f"{scrape_res.origin_airport}->{scrape_res.destination_airport}"
+                            if scrape_res.origin_airport and scrape_res.destination_airport
+                            else f"{dest_meta.get('origin')}->{dest_meta.get('destination')}"
+                        )
                         item_summary = {
                             "slot_id": s_id,
                             "destination_id": d_id,
@@ -204,6 +213,9 @@ def run_sharded_dispatcher(
                             "outbound_date": slot.get("outbound_date"),
                             "return_date": slot.get("return_date"),
                             "status": "OK",
+                            "winning_route": winning_route,
+                            "origin_airport": scrape_res.origin_airport,
+                            "destination_airport": scrape_res.destination_airport,
                             "cheapest_tab_price": scrape_res.cheapest_tab_price,
                             "best_tab_price": scrape_res.best_tab_price,
                             "cheapest_airline": scrape_res.cheapest_airline,
@@ -250,7 +262,7 @@ def run_sharded_dispatcher(
 
                     # Anti-ban jitter between date slots inside the same shard
                     if slot_idx < len(dest_slots) - 1:
-                        time.sleep(random.uniform(1.1, 2.4))
+                        time.sleep(random.uniform(2.5, 4.5))
 
                 # Consolidated Destination Digest Alert (ONE grouped Telegram card per destination)
                 if triggered_for_dest:

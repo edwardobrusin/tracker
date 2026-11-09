@@ -27,6 +27,10 @@ from src.config import DEFAULT_CURRENCY, DEFAULT_GL, DEFAULT_HL, MAX_SLOTS_PER_D
 
 __all__ = [
     "FilterProfile",
+    "METRO_IATA_EXPANSION_MAP",
+    "parse_iata_list",
+    "normalize_iata_codes",
+    "format_corridor_display",
     "encode_tfs_protobuf",
     "build_google_flights_url",
     "decode_tfs_parameter",
@@ -37,6 +41,103 @@ __all__ = [
 ]
 
 logger = logging.getLogger("flightpulse.tfs_builder")
+
+# Deterministic expansion of Metropolitan Area IATA codes into physical airport IATAs
+METRO_IATA_EXPANSION_MAP: dict[str, tuple[str, ...]] = {
+    "TYO": ("NRT", "HND"),
+    "LON": ("LHR", "LGW", "STN", "LTN", "LCY"),
+    "NYC": ("JFK", "EWR", "LGA"),
+    "PAR": ("CDG", "ORY"),
+    "ROM": ("FCO", "CIA"),
+    "MIL": ("MXP", "LIN", "BGY"),
+    "CHI": ("ORD", "MDW"),
+    "WAS": ("IAD", "DCA", "BWI"),
+    "BUE": ("EZE", "AEP"),
+    "SAO": ("GRU", "CGH", "VCP"),
+    "RIO": ("GIG", "SDU"),
+    "SEL": ("ICN", "GMP"),
+    "YTO": ("YYZ", "YTZ"),
+    "BJS": ("PEK", "PKX"),
+    "OSA": ("KIX", "ITM"),
+}
+
+IATA_TOKEN_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def parse_iata_list(
+    raw_value: str | Sequence[str],
+    expand_metro: bool = True,
+    max_airports: int = 7,
+) -> list[str]:
+    """
+    Parse, validate, deduplicate, and optionally expand metro codes from a comma/space/slash
+    delimited string or sequence of IATA codes.
+    Raises ValueError if no valid 3-letter IATA codes are provided or if any token is invalid.
+    """
+    if isinstance(raw_value, str):
+        raw_tokens = [tok.strip().upper() for tok in re.split(r"[,;/\s]+", raw_value) if tok.strip()]
+    elif isinstance(raw_value, Sequence):
+        raw_tokens = []
+        for item in raw_value:
+            for tok in re.split(r"[,;/\s]+", str(item)):
+                if tok.strip():
+                    raw_tokens.append(tok.strip().upper())
+    else:
+        raw_tokens = []
+
+    if not raw_tokens:
+        raise ValueError("Se requiere al menos un código IATA de 3 letras (ej. MEX o MEX, NLU).")
+
+    resolved: list[str] = []
+    for token in raw_tokens:
+        if not IATA_TOKEN_RE.match(token):
+            raise ValueError(
+                f"Código IATA inválido '{token}'. Cada aeropuerto debe tener exactamente 3 letras (ej. MEX, NLU, NRT)."
+            )
+        expanded = METRO_IATA_EXPANSION_MAP.get(token, (token,)) if expand_metro else (token,)
+        for code in expanded:
+            if code not in resolved:
+                resolved.append(code)
+
+    return resolved[:max_airports]
+
+
+def normalize_iata_codes(
+    raw_value: str | Sequence[str],
+    expand_metro: bool = True,
+    max_airports: int = 7,
+) -> str:
+    """
+    Return the canonical comma-delimited string representation (without spaces)
+    for storage in `destinations.origin` and `destinations.destination`, e.g. 'MEX,NLU'.
+    """
+    return ",".join(parse_iata_list(raw_value, expand_metro=expand_metro, max_airports=max_airports))
+
+
+def format_corridor_display(
+    origin: str | Sequence[str],
+    destination: str | Sequence[str],
+    arrow: str = "➔",
+) -> str:
+    """
+    Format an N:M airport corridor for UI and Telegram headers:
+      Single: 'MEX ➔ MAD'
+      Multi:  '[MEX, NLU] ➔ [NRT, HND]'
+    """
+    try:
+        orig_list = parse_iata_list(origin, expand_metro=False)
+    except ValueError:
+        orig_list = [str(origin).strip().upper() or "MEX"]
+
+    try:
+        dest_list = parse_iata_list(destination, expand_metro=False)
+    except ValueError:
+        dest_list = [str(destination).strip().upper() or "MAD"]
+
+    is_multi = len(orig_list) > 1 or len(dest_list) > 1
+    if is_multi:
+        return f"[{', '.join(orig_list)}] {arrow} [{', '.join(dest_list)}]"
+    return f"{orig_list[0]} {arrow} {dest_list[0]}"
 
 SPANISH_WEEKDAYS = ("Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom")
 SPANISH_MONTHS = (
@@ -196,8 +297,8 @@ def _encode_airport_message(iata_code: str) -> bytes:
 
 
 def _encode_flight_slice_message(
-    origin: str,
-    destination: str,
+    origin: str | Sequence[str],
+    destination: str | Sequence[str],
     flight_date: str,
     max_stops: Optional[int] = None,
     airlines: Optional[Sequence[str]] = None,
@@ -207,7 +308,7 @@ def _encode_flight_slice_message(
     arr_end_hour: int = 23,
 ) -> bytes:
     """
-    Encode a single FlightSlice (outbound or return leg) message:
+    Encode a single FlightSlice (outbound or return leg) message supporting N:M airports:
       field 2 (string): YYYY-MM-DD
       field 5 (varint, optional): max_stops (0=Nonstop, 1=Max 1 stop, 2=Max 2 stops)
       field 6 (string, repeated): allowed IATA airline codes
@@ -215,9 +316,12 @@ def _encode_flight_slice_message(
       field 9 (varint, optional): latest departure hour (1..24)
       field 10 (varint, optional): earliest arrival hour (0..23)
       field 11 (varint, optional): latest arrival hour (1..24)
-      field 13 (message): origin Airport
-      field 14 (message): destination Airport
+      field 13 (message, repeated): origin Airport(s) (tag 0x6a repeated per origin IATA)
+      field 14 (message, repeated): destination Airport(s) (tag 0x72 repeated per destination IATA)
     """
+    origin_list = parse_iata_list(origin, expand_metro=True)
+    destination_list = parse_iata_list(destination, expand_metro=True)
+
     buf = bytearray()
     buf.extend(_encode_string_field(2, flight_date.strip()))
 
@@ -233,7 +337,6 @@ def _encode_flight_slice_message(
     # Departure hour window (only encode when constrained away from full day 0..23)
     if 0 < dep_start_hour <= 23 or 0 <= dep_end_hour < 23:
         buf.extend(_encode_varint_field(8, max(0, min(23, int(dep_start_hour)))))
-        # Google Flights uses 1..24 for upper hour bound
         upper_dep = int(dep_end_hour) + 1 if int(dep_end_hour) < 23 else 24
         buf.extend(_encode_varint_field(9, max(1, min(24, upper_dep))))
 
@@ -243,24 +346,30 @@ def _encode_flight_slice_message(
         upper_arr = int(arr_end_hour) + 1 if int(arr_end_hour) < 23 else 24
         buf.extend(_encode_varint_field(11, max(1, min(24, upper_arr))))
 
-    buf.extend(_encode_bytes_field(13, _encode_airport_message(origin)))
-    buf.extend(_encode_bytes_field(14, _encode_airport_message(destination)))
+    # Emit repeated field 13 (0x6a) for each origin airport
+    for orig_iata in origin_list:
+        buf.extend(_encode_bytes_field(13, _encode_airport_message(orig_iata)))
+
+    # Emit repeated field 14 (0x72) for each destination airport
+    for dest_iata in destination_list:
+        buf.extend(_encode_bytes_field(14, _encode_airport_message(dest_iata)))
+
     return bytes(buf)
 
 
 def encode_tfs_protobuf(
-    origin: str,
-    destination: str,
+    origin: str | Sequence[str],
+    destination: str | Sequence[str],
     outbound_date: str,
     return_date: Optional[str] = None,
     trip_type: str = "round-trip",
     filter_profile: Optional[FilterProfile | dict[str, Any]] = None,
 ) -> str:
     """
-    Deterministically encode a complete Google Flights `?tfs=` URL-safe Base64 parameter.
-    Uses `fast-flights` TFSData when no custom sub-slice filters (airlines/hours/bags)
-    are active, or our full-featured pure-Python Protobuf wire encoder so every filter
-    profile option is faithfully preserved.
+    Deterministically encode a complete Google Flights `?tfs=` URL-safe Base64 parameter
+    supporting both 1:1 and N:M multi-airport corridors.
+    Bypasses `fast-flights` automatically when multiple origins/destinations or advanced
+    slice filters are active so repeated field 13 and field 14 messages are preserved.
     """
     profile = (
         filter_profile
@@ -268,13 +377,18 @@ def encode_tfs_protobuf(
         else FilterProfile.from_dict(filter_profile)
     )
 
+    origin_list = parse_iata_list(origin, expand_metro=True)
+    destination_list = parse_iata_list(destination, expand_metro=True)
+    is_multi_airport = len(origin_list) > 1 or len(destination_list) > 1
+
     is_one_way = trip_type.strip().lower() in ("one-way", "one_way", "oneway") or not return_date
     trip_enum = 2 if is_one_way else 1
     seat_enum = CABIN_MAP.get(profile.seat.lower(), 1)
     adults_count = max(1, min(9, int(profile.adults)))
 
     has_advanced_filters = bool(
-        profile.airlines
+        is_multi_airport
+        or profile.airlines
         or profile.carry_on_bags > 0
         or profile.dep_start_hour > 0
         or profile.dep_end_hour < 23
@@ -286,7 +400,7 @@ def encode_tfs_protobuf(
         or profile.ret_arr_end_hour < 23
     )
 
-    # Attempt fast-flights TFSData helper when only standard fields are used
+    # Attempt fast-flights TFSData helper only when 1:1 single airport and no advanced filters
     if not has_advanced_filters:
         try:
             from fast_flights import FlightQuery, Passengers, create_filter
@@ -294,8 +408,8 @@ def encode_tfs_protobuf(
             ff_flights = [
                 FlightQuery(
                     date=outbound_date.strip(),
-                    from_airport=origin.strip().upper(),
-                    to_airport=destination.strip().upper(),
+                    from_airport=origin_list[0],
+                    to_airport=destination_list[0],
                     max_stops=profile.max_stops,
                 )
             ]
@@ -303,8 +417,8 @@ def encode_tfs_protobuf(
                 ff_flights.append(
                     FlightQuery(
                         date=return_date.strip(),
-                        from_airport=destination.strip().upper(),
-                        to_airport=origin.strip().upper(),
+                        from_airport=destination_list[0],
+                        to_airport=origin_list[0],
                         max_stops=profile.max_stops,
                     )
                 )
@@ -319,7 +433,6 @@ def encode_tfs_protobuf(
             if b64_str:
                 return b64_str
         except Exception:
-            # Fall through to deterministic pure-Python Protobuf wire encoder
             pass
 
     root = bytearray()
@@ -328,10 +441,10 @@ def encode_tfs_protobuf(
     # Field 2: trip type (1 = round-trip, 2 = one-way)
     root.extend(_encode_varint_field(2, trip_enum))
 
-    # Field 3 (slice 1): Outbound leg
+    # Field 3 (slice 1): Outbound leg (origins -> destinations)
     outbound_slice = _encode_flight_slice_message(
-        origin=origin,
-        destination=destination,
+        origin=origin_list,
+        destination=destination_list,
         flight_date=outbound_date,
         max_stops=profile.max_stops,
         airlines=profile.airlines,
@@ -342,11 +455,11 @@ def encode_tfs_protobuf(
     )
     root.extend(_encode_bytes_field(3, outbound_slice))
 
-    # Field 3 (slice 2): Return leg (for round-trip)
+    # Field 3 (slice 2): Return leg (destinations -> origins)
     if not is_one_way and return_date:
         return_slice = _encode_flight_slice_message(
-            origin=destination,
-            destination=origin,
+            origin=destination_list,
+            destination=origin_list,
             flight_date=return_date,
             max_stops=profile.max_stops,
             airlines=profile.airlines,
@@ -377,8 +490,8 @@ def encode_tfs_protobuf(
 
 
 def build_google_flights_url(
-    origin: str,
-    destination: str,
+    origin: str | Sequence[str],
+    destination: str | Sequence[str],
     outbound_date: str,
     return_date: Optional[str] = None,
     trip_type: str = "round-trip",
@@ -473,12 +586,14 @@ def _parse_protobuf_fields(data: bytes) -> list[tuple[int, int, Any]]:
 
 def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
     """
-    Decode a Google Flights `?tfs=` Base64 Protobuf string to extract legs
-    (dates, origin, destination, max_stops, airlines) for Mode A pasted URLs.
+    Decode a Google Flights `?tfs=` Base64 Protobuf string (or full URL) to extract legs
+    (dates, multiple origins, multiple destinations, max_stops, airlines) for Mode A pasted URLs.
     """
     result: dict[str, Any] = {
         "origin": None,
         "destination": None,
+        "origins": [],
+        "destinations": [],
         "outbound_date": None,
         "return_date": None,
         "trip_type": "round-trip",
@@ -489,11 +604,15 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
         return result
 
     cleaned = tfs_b64.strip()
+    if "tfs=" in cleaned:
+        tfs_match = re.search(r"[?&]tfs=([^&#]+)", cleaned)
+        if tfs_match:
+            cleaned = tfs_match.group(1)
+
     padding = (4 - len(cleaned) % 4) % 4
     padded = cleaned + ("=" * padding)
 
     try:
-        # Handle both URL-safe and standard base64
         raw_bytes = base64.urlsafe_b64decode(padded)
     except Exception:
         try:
@@ -509,8 +628,8 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
         elif field_num == 3 and wire_type == 2 and isinstance(val, bytes):
             slice_info: dict[str, Any] = {
                 "date": None,
-                "origin": None,
-                "destination": None,
+                "origins": [],
+                "destinations": [],
                 "max_stops": None,
                 "airlines": [],
             }
@@ -534,14 +653,13 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
                     for ap_num, ap_wire, ap_val in ap_fields:
                         if ap_num == 2 and ap_wire == 2 and isinstance(ap_val, bytes):
                             code = ap_val.decode("utf-8", errors="ignore").strip().upper()
-                            if code:
-                                if s_num == 13:
-                                    slice_info["origin"] = code
-                                else:
-                                    slice_info["destination"] = code
+                            if IATA_TOKEN_RE.match(code):
+                                if s_num == 13 and code not in slice_info["origins"]:
+                                    slice_info["origins"].append(code)
+                                elif s_num == 14 and code not in slice_info["destinations"]:
+                                    slice_info["destinations"].append(code)
             slices.append(slice_info)
 
-    # Also fallback to regex scan on raw decoded bytes if dates/IATA codes were nested differently
     if not slices or not slices[0].get("date"):
         date_matches = re.findall(rb"(20\d{2}-\d{2}-\d{2})", raw_bytes)
         decoded_dates = [m.decode("ascii") for m in date_matches]
@@ -553,9 +671,13 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
                 result["trip_type"] = "one-way"
     else:
         first = slices[0]
+        origins_list = first.get("origins") or []
+        destinations_list = first.get("destinations") or []
         result["outbound_date"] = first.get("date")
-        result["origin"] = first.get("origin")
-        result["destination"] = first.get("destination")
+        result["origins"] = origins_list
+        result["destinations"] = destinations_list
+        result["origin"] = ",".join(origins_list) if origins_list else None
+        result["destination"] = ",".join(destinations_list) if destinations_list else None
         result["max_stops"] = first.get("max_stops")
         result["airlines"] = first.get("airlines") or []
         if len(slices) >= 2 and slices[1].get("date"):

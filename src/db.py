@@ -7,18 +7,35 @@ Implements the 4-table hierarchical schema:
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from decimal import Decimal
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
-try:
+if sys.version_info >= (3, 11):
+    from typing import LiteralString
+else:
+    try:
+        from typing_extensions import LiteralString
+    except ImportError:
+        LiteralString = str  # type: ignore[assignment,misc]
+
+if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import dict_row
     from psycopg.types.json import Jsonb
-except ImportError:
-    psycopg = None  # type: ignore[assignment]
-    dict_row = None  # type: ignore[assignment]
-    Jsonb = dict  # type: ignore[assignment,misc]
+else:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        from psycopg.types.json import Jsonb
+    except ImportError:
+        psycopg = None
+        dict_row = None
+
+        class Jsonb:  # type: ignore[no-redef]
+            def __init__(self, val: Any) -> None:
+                self.val = val
 
 from src.config import (
     DATABASE_URL,
@@ -31,6 +48,12 @@ from src.config import (
     MAX_TOTAL_SLOTS,
     get_flight_window_status,
 )
+from src.tfs_builder import (
+    FilterProfile,
+    build_google_flights_url,
+    normalize_iata_codes,
+    parse_iata_list,
+)
 
 logger = logging.getLogger("flightpulse.db")
 
@@ -38,8 +61,10 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS destinations (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    origin VARCHAR(10) NOT NULL,
-    destination VARCHAR(10) NOT NULL,
+    origin VARCHAR(64) NOT NULL,
+    destination VARCHAR(64) NOT NULL,
+    origin_airports TEXT[] NOT NULL DEFAULT '{}',
+    destination_airports TEXT[] NOT NULL DEFAULT '{}',
     trip_type VARCHAR(20) DEFAULT 'round-trip',
     currency VARCHAR(10) DEFAULT 'MXN',
     gl VARCHAR(10) DEFAULT 'MX',
@@ -68,6 +93,10 @@ CREATE TABLE IF NOT EXISTS date_slots (
     latest_airline TEXT,
     latest_stops TEXT,
     latest_duration TEXT,
+    latest_origin_airport VARCHAR(10),
+    latest_destination_airport VARCHAR(10),
+    latest_best_origin_airport VARCHAR(10),
+    latest_best_destination_airport VARCHAR(10),
     latest_is_self_transfer BOOLEAN DEFAULT FALSE,
     all_time_low_price NUMERIC(12, 2),
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -84,9 +113,13 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     cheapest_stops TEXT,
     cheapest_duration TEXT,
     cheapest_dep_arr TEXT,
+    origin_airport VARCHAR(10),
+    destination_airport VARCHAR(10),
     best_airline TEXT,
     best_stops TEXT,
     best_duration TEXT,
+    best_origin_airport VARCHAR(10),
+    best_destination_airport VARCHAR(10),
     is_self_transfer BOOLEAN DEFAULT FALSE,
     extraction_source VARCHAR(30) DEFAULT 'patchright_dom',
     raw_top_offers JSONB DEFAULT '[]'
@@ -119,6 +152,31 @@ CREATE INDEX IF NOT EXISTS idx_alert_logs_dest_sent
     ON alert_logs(destination_id, sent_at DESC);
 """
 
+MIGRATION_SQL = """
+ALTER TABLE IF EXISTS destinations
+    ALTER COLUMN origin TYPE VARCHAR(64),
+    ALTER COLUMN destination TYPE VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS origin_airports TEXT[] NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS destination_airports TEXT[] NOT NULL DEFAULT '{}';
+
+UPDATE destinations
+SET origin_airports = string_to_array(regexp_replace(upper(origin), '\\s+', '', 'g'), ','),
+    destination_airports = string_to_array(regexp_replace(upper(destination), '\\s+', '', 'g'), ',')
+WHERE cardinality(origin_airports) = 0 OR cardinality(destination_airports) = 0;
+
+ALTER TABLE IF EXISTS date_slots
+    ADD COLUMN IF NOT EXISTS latest_origin_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS latest_destination_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS latest_best_origin_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS latest_best_destination_airport VARCHAR(10);
+
+ALTER TABLE IF EXISTS price_snapshots
+    ADD COLUMN IF NOT EXISTS origin_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS destination_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS best_origin_airport VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS best_destination_airport VARCHAR(10);
+"""
+
 
 def _to_float(val: Any) -> Optional[float]:
     if val is None:
@@ -133,7 +191,7 @@ def _to_float(val: Any) -> Optional[float]:
         return None
 
 
-def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Connection:
+def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Connection[Any]:
     """
     Create a psycopg v3 connection to Neon Serverless PostgreSQL with retry
     logic to handle serverless compute cold-starts gracefully.
@@ -143,10 +201,15 @@ def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Conn
             "DATABASE_URL is not configured. Set DATABASE_URL in your .env file or Streamlit secrets."
         )
 
+    if psycopg is None or dict_row is None:
+        raise RuntimeError(
+            "psycopg is not installed. Install psycopg[binary] to connect to Neon PostgreSQL."
+        )
+
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            conn = psycopg.connect(
+            conn: psycopg.Connection[Any] = cast(Any, psycopg).connect(
                 DATABASE_URL,
                 row_factory=dict_row,
                 connect_timeout=15,
@@ -169,13 +232,15 @@ def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Conn
 
 def init_db() -> None:
     """
-    Auto-initialize the 4 tables and supporting indexes in Neon PostgreSQL.
+    Auto-initialize the 4 tables, execute idempotent N:M multi-airport migrations,
+    and verify indexes in Neon PostgreSQL.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(SCHEMA_SQL)
+            cur.execute(cast(LiteralString, SCHEMA_SQL))
+            cur.execute(cast(LiteralString, MIGRATION_SQL))
         conn.commit()
-    logger.info("Database schema initialized and verified (4 tables ready).")
+    logger.info("Database schema initialized and migrated for N:M Multi-Airport support.")
 
 
 # ==============================================================================
@@ -211,7 +276,7 @@ def list_destinations(active_only: bool = False) -> list[dict[str, Any]]:
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query)
+            cur.execute(cast(LiteralString, query))
             rows = cur.fetchall()
 
     results: list[dict[str, Any]] = []
@@ -254,8 +319,8 @@ def get_destination(destination_id: int) -> Optional[dict[str, Any]]:
 
 def create_destination(
     name: str,
-    origin: str,
-    destination: str,
+    origin: str | list[str],
+    destination: str | list[str],
     target_price: float,
     trip_type: str = "round-trip",
     currency: str = DEFAULT_CURRENCY,
@@ -267,9 +332,15 @@ def create_destination(
     is_active: bool = True,
 ) -> int:
     """
-    Create a new destination corridor & filter profile.
-    Enforces the 10-destination active matrix limit when is_active=True.
+    Create a new N:M multi-airport destination corridor & filter profile.
+    Validates and normalizes IATA lists (expanding metro codes like TYO -> NRT,HND)
+    and enforces the 10-destination active matrix limit when is_active=True.
     """
+    origin_airports = parse_iata_list(origin, expand_metro=True)
+    destination_airports = parse_iata_list(destination, expand_metro=True)
+    norm_origin = ",".join(origin_airports)
+    norm_dest = ",".join(destination_airports)
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             if is_active:
@@ -285,17 +356,20 @@ def create_destination(
             cur.execute(
                 """
                 INSERT INTO destinations (
-                    name, origin, destination, trip_type, currency, gl, hl,
+                    name, origin, destination, origin_airports, destination_airports,
+                    trip_type, currency, gl, hl,
                     target_price, check_interval_minutes, cooldown_hours,
                     filter_config, is_active
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
                 """,
                 (
                     name.strip(),
-                    origin.strip().upper(),
-                    destination.strip().upper(),
+                    norm_origin,
+                    norm_dest,
+                    origin_airports,
+                    destination_airports,
                     trip_type.strip().lower(),
                     currency.strip().upper(),
                     gl.strip().upper(),
@@ -308,17 +382,19 @@ def create_destination(
                 ),
             )
             row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Failed to create destination: no row returned.")
             new_id = int(row["id"])
         conn.commit()
-    logger.info("Created destination id=%d (%s: %s -> %s)", new_id, name, origin, destination)
+    logger.info("Created destination id=%d (%s: %s -> %s)", new_id, name, norm_origin, norm_dest)
     return new_id
 
 
 def update_destination(
     destination_id: int,
     name: str,
-    origin: str,
-    destination: str,
+    origin: str | list[str],
+    destination: str | list[str],
     target_price: float,
     trip_type: str = "round-trip",
     currency: str = DEFAULT_CURRENCY,
@@ -330,8 +406,19 @@ def update_destination(
     is_active: bool = True,
 ) -> None:
     """
-    Update an existing destination's metadata and filter profile.
+    Update an existing destination's metadata, N:M airport lists, and filter profile,
+    and automatically regenerate `google_flights_url` on all child `date_slots`.
     """
+    origin_airports = parse_iata_list(origin, expand_metro=True)
+    destination_airports = parse_iata_list(destination, expand_metro=True)
+    norm_origin = ",".join(origin_airports)
+    norm_dest = ",".join(destination_airports)
+    clean_trip = trip_type.strip().lower()
+    clean_curr = currency.strip().upper()
+    clean_gl = gl.strip().upper()
+    clean_hl = hl.strip().lower()
+    profile_obj = FilterProfile.from_dict(filter_config or {})
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             if is_active:
@@ -351,6 +438,8 @@ def update_destination(
                 SET name = %s,
                     origin = %s,
                     destination = %s,
+                    origin_airports = %s,
+                    destination_airports = %s,
                     trip_type = %s,
                     currency = %s,
                     gl = %s,
@@ -364,12 +453,14 @@ def update_destination(
                 """,
                 (
                     name.strip(),
-                    origin.strip().upper(),
-                    destination.strip().upper(),
-                    trip_type.strip().lower(),
-                    currency.strip().upper(),
-                    gl.strip().upper(),
-                    hl.strip().lower(),
+                    norm_origin,
+                    norm_dest,
+                    origin_airports,
+                    destination_airports,
+                    clean_trip,
+                    clean_curr,
+                    clean_gl,
+                    clean_hl,
                     Decimal(str(round(target_price, 2))),
                     int(check_interval_minutes),
                     int(cooldown_hours),
@@ -378,6 +469,29 @@ def update_destination(
                     destination_id,
                 ),
             )
+
+            # Synchronize all existing date_slots URLs with the updated N:M corridor and filters
+            cur.execute(
+                "SELECT id, outbound_date, return_date FROM date_slots WHERE destination_id = %s;",
+                (destination_id,),
+            )
+            slot_rows = cur.fetchall()
+            for s_row in slot_rows:
+                rebuilt_url = build_google_flights_url(
+                    origin=origin_airports,
+                    destination=destination_airports,
+                    outbound_date=str(s_row["outbound_date"]),
+                    return_date=s_row.get("return_date"),
+                    trip_type=clean_trip,
+                    filter_profile=profile_obj,
+                    curr=clean_curr,
+                    gl=clean_gl,
+                    hl=clean_hl,
+                )
+                cur.execute(
+                    "UPDATE date_slots SET google_flights_url = %s WHERE id = %s;",
+                    (rebuilt_url, int(s_row["id"])),
+                )
         conn.commit()
 
 
@@ -459,7 +573,7 @@ def list_date_slots(
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, tuple(params))
+            cur.execute(cast(LiteralString, query), tuple(params))
             rows = cur.fetchall()
 
     results: list[dict[str, Any]] = []
@@ -471,7 +585,7 @@ def list_date_slots(
         item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
         item["target_price"] = _to_float(item.get("target_price")) or 0.0
         item["filter_config"] = item.get("filter_config") or {}
-        item["window_info"] = get_flight_window_status(item.get("outbound_date"))
+        item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
         results.append(item)
     return results
 
@@ -534,14 +648,16 @@ def create_date_slot(
                     "SELECT COUNT(*) AS cnt FROM date_slots WHERE destination_id = %s AND is_active = TRUE;",
                     (destination_id,),
                 )
-                dest_cnt = int(cur.fetchone()["cnt"])
+                dest_cnt_row = cur.fetchone()
+                dest_cnt = int(dest_cnt_row["cnt"]) if dest_cnt_row else 0
                 if dest_cnt >= MAX_SLOTS_PER_DESTINATION:
                     raise ValueError(
                         f"Destination already has {MAX_SLOTS_PER_DESTINATION} active date slots (max {MAX_SLOTS_PER_DESTINATION})."
                     )
 
                 cur.execute("SELECT COUNT(*) AS cnt FROM date_slots WHERE is_active = TRUE;")
-                total_cnt = int(cur.fetchone()["cnt"])
+                total_cnt_row = cur.fetchone()
+                total_cnt = int(total_cnt_row["cnt"]) if total_cnt_row else 0
                 if total_cnt >= MAX_TOTAL_SLOTS:
                     raise ValueError(
                         f"Matrix capacity limit reached ({MAX_TOTAL_SLOTS} total active date slots)."
@@ -564,7 +680,10 @@ def create_date_slot(
                     bool(is_active),
                 ),
             )
-            slot_id = int(cur.fetchone()["id"])
+            slot_row = cur.fetchone()
+            if not slot_row:
+                raise RuntimeError("Failed to insert date_slot: no row returned.")
+            slot_id = int(slot_row["id"])
         conn.commit()
     return slot_id
 
@@ -588,11 +707,13 @@ def bulk_create_date_slots(
                 "SELECT COUNT(*) AS cnt FROM date_slots WHERE destination_id = %s AND is_active = TRUE;",
                 (destination_id,),
             )
-            existing_active = int(cur.fetchone()["cnt"])
+            existing_row = cur.fetchone()
+            existing_active = int(existing_row["cnt"]) if existing_row else 0
             available_for_dest = max(0, MAX_SLOTS_PER_DESTINATION - existing_active)
 
             cur.execute("SELECT COUNT(*) AS cnt FROM date_slots WHERE is_active = TRUE;")
-            total_active = int(cur.fetchone()["cnt"])
+            total_row = cur.fetchone()
+            total_active = int(total_row["cnt"]) if total_row else 0
             available_total = max(0, MAX_TOTAL_SLOTS - total_active)
 
             max_can_add = min(available_for_dest, available_total, len(slots))
@@ -619,7 +740,9 @@ def bulk_create_date_slots(
                     """,
                     (destination_id, label, outbound_date, return_date, url, is_active),
                 )
-                created_ids.append(int(cur.fetchone()["id"]))
+                ins_row = cur.fetchone()
+                if ins_row:
+                    created_ids.append(int(ins_row["id"]))
         conn.commit()
 
     logger.info(
@@ -647,7 +770,8 @@ def set_date_slot_active(slot_id: int, is_active: bool) -> None:
                     "SELECT COUNT(*) AS cnt FROM date_slots WHERE destination_id = %s AND is_active = TRUE AND id != %s;",
                     (dest_id, slot_id),
                 )
-                if int(cur.fetchone()["cnt"]) >= MAX_SLOTS_PER_DESTINATION:
+                slot_cnt_row = cur.fetchone()
+                if slot_cnt_row and int(slot_cnt_row["cnt"]) >= MAX_SLOTS_PER_DESTINATION:
                     raise ValueError(
                         f"Maximum of {MAX_SLOTS_PER_DESTINATION} active date slots per destination reached."
                     )
@@ -689,9 +813,10 @@ def fetch_due_date_slots(
     else:
         conditions.append("ds.is_active = TRUE")
         conditions.append("d.is_active = TRUE")
-        # Enforce Google Flights 330-day airline schedule release window
+        # Enforce Google Flights 330-day airline schedule release window (both outbound & return)
         conditions.append("ds.outbound_date::date <= (CURRENT_DATE + INTERVAL '330 days')")
         conditions.append("ds.outbound_date::date >= CURRENT_DATE")
+        conditions.append("(ds.return_date IS NULL OR ds.return_date::date <= (CURRENT_DATE + INTERVAL '330 days'))")
         if destination_id is not None:
             conditions.append("ds.destination_id = %s")
             params.append(destination_id)
@@ -725,7 +850,7 @@ def fetch_due_date_slots(
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, tuple(params))
+            cur.execute(cast(LiteralString, query), tuple(params))
             rows = cur.fetchall()
 
     results: list[dict[str, Any]] = []
@@ -737,7 +862,7 @@ def fetch_due_date_slots(
         item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
         item["target_price"] = _to_float(item.get("target_price")) or 0.0
         item["filter_config"] = item.get("filter_config") or {}
-        item["window_info"] = get_flight_window_status(item.get("outbound_date"))
+        item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
         results.append(item)
     return results
 
@@ -756,21 +881,28 @@ def record_price_snapshot(
     cheapest_stops: Optional[str] = None,
     cheapest_duration: Optional[str] = None,
     cheapest_dep_arr: Optional[str] = None,
+    origin_airport: Optional[str] = None,
+    destination_airport: Optional[str] = None,
     best_airline: Optional[str] = None,
     best_stops: Optional[str] = None,
     best_duration: Optional[str] = None,
+    best_origin_airport: Optional[str] = None,
+    best_destination_airport: Optional[str] = None,
     is_self_transfer: bool = False,
     extraction_source: str = "patchright_dom",
     raw_top_offers: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
-    Persist a new dual-tab price snapshot and atomically update the parent `date_slots`
-    cached columns (`latest_cheapest_price`, `latest_best_price`, `all_time_low_price`,
-    `last_checked_at`, etc.). Also returns historical baseline metrics (prior all-time low
-    and 7-day rolling average) prior to this snapshot for accurate alert trigger evaluation.
+    Persist a new dual-tab price snapshot including winning N:M airports
+    (`origin_airport`, `destination_airport`, `best_origin_airport`, `best_destination_airport`)
+    and atomically update the parent `date_slots` cached columns.
     """
     cheapest_dec = Decimal(str(round(cheapest_tab_price, 2)))
     best_dec = Decimal(str(round(best_tab_price, 2))) if best_tab_price is not None else None
+    clean_orig = origin_airport.strip().upper()[:10] if origin_airport else None
+    clean_dest = destination_airport.strip().upper()[:10] if destination_airport else None
+    clean_best_orig = (best_origin_airport or origin_airport or "").strip().upper()[:10] or None
+    clean_best_dest = (best_destination_airport or destination_airport or "").strip().upper()[:10] or None
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -803,7 +935,8 @@ def record_price_snapshot(
                 """,
                 (date_slot_id, date_slot_id, date_slot_id, date_slot_id),
             )
-            stats_row = cur.fetchone() or {}
+            stats_row_raw = cur.fetchone()
+            stats_row = dict(stats_row_raw) if stats_row_raw else {}
 
             slot_atl = _to_float(stats_row.get("slot_all_time_low"))
             snap_min = _to_float(stats_row.get("snap_min_price"))
@@ -821,10 +954,12 @@ def record_price_snapshot(
                 INSERT INTO price_snapshots (
                     date_slot_id, destination_id, cheapest_tab_price, best_tab_price,
                     cheapest_airline, cheapest_stops, cheapest_duration, cheapest_dep_arr,
+                    origin_airport, destination_airport,
                     best_airline, best_stops, best_duration,
+                    best_origin_airport, best_destination_airport,
                     is_self_transfer, extraction_source, raw_top_offers
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, scraped_at;
                 """,
                 (
@@ -836,15 +971,21 @@ def record_price_snapshot(
                     cheapest_stops,
                     cheapest_duration,
                     cheapest_dep_arr,
+                    clean_orig,
+                    clean_dest,
                     best_airline,
                     best_stops,
                     best_duration,
+                    clean_best_orig,
+                    clean_best_dest,
                     bool(is_self_transfer),
                     extraction_source[:30],
                     Jsonb(raw_top_offers or []),
                 ),
             )
             snap_inserted = cur.fetchone()
+            if not snap_inserted:
+                raise RuntimeError("Failed to record price snapshot: no row returned.")
             snapshot_id = int(snap_inserted["id"])
             scraped_at = snap_inserted["scraped_at"]
 
@@ -864,6 +1005,10 @@ def record_price_snapshot(
                     latest_airline = %s,
                     latest_stops = %s,
                     latest_duration = %s,
+                    latest_origin_airport = %s,
+                    latest_destination_airport = %s,
+                    latest_best_origin_airport = %s,
+                    latest_best_destination_airport = %s,
                     latest_is_self_transfer = %s,
                     all_time_low_price = %s
                 WHERE id = %s;
@@ -874,6 +1019,10 @@ def record_price_snapshot(
                     cheapest_airline,
                     cheapest_stops,
                     cheapest_duration,
+                    clean_orig,
+                    clean_dest,
+                    clean_best_orig,
+                    clean_best_dest,
                     bool(is_self_transfer),
                     Decimal(str(round(new_all_time_low, 2))),
                     date_slot_id,
@@ -991,7 +1140,9 @@ def record_alert_and_update_slots(
                         message_preview[:1500],
                     ),
                 )
-                log_ids.append(int(cur.fetchone()["id"]))
+                ins_alert = cur.fetchone()
+                if ins_alert:
+                    log_ids.append(int(ins_alert["id"]))
 
                 if slot_id is not None and cheapest_dec is not None:
                     cur.execute(
@@ -1060,13 +1211,17 @@ def get_dashboard_summary() -> dict[str, Any]:
                         WHERE ds.is_active = TRUE AND d.is_active = TRUE
                           AND ds.outbound_date::date <= CURRENT_DATE + INTERVAL '330 days'
                           AND ds.outbound_date::date >= CURRENT_DATE
+                          AND (ds.return_date IS NULL OR ds.return_date::date <= CURRENT_DATE + INTERVAL '330 days')
                     ) AS slots_in_window,
                     (
                         SELECT COUNT(*)
                         FROM date_slots ds
                         JOIN destinations d ON d.id = ds.destination_id
                         WHERE ds.is_active = TRUE AND d.is_active = TRUE
-                          AND ds.outbound_date::date > CURRENT_DATE + INTERVAL '330 days'
+                          AND (
+                              ds.outbound_date::date > CURRENT_DATE + INTERVAL '330 days'
+                              OR ds.return_date::date > CURRENT_DATE + INTERVAL '330 days'
+                          )
                     ) AS slots_pending_release,
                     (SELECT COUNT(*) FROM date_slots) AS total_date_slots,
                     (
@@ -1080,7 +1235,8 @@ def get_dashboard_summary() -> dict[str, Any]:
                     ) AS slots_below_target;
                 """
             )
-            counts = cur.fetchone() or {}
+            counts_row = cur.fetchone()
+            counts = dict(counts_row) if counts_row else {}
 
             # Best deal across all active dates
             cur.execute(
@@ -1093,6 +1249,8 @@ def get_dashboard_summary() -> dict[str, Any]:
                     ds.latest_cheapest_price,
                     ds.latest_best_price,
                     ds.latest_airline,
+                    ds.latest_origin_airport,
+                    ds.latest_destination_airport,
                     d.name AS destination_name,
                     d.origin,
                     d.destination AS destination_code,

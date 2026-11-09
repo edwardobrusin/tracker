@@ -82,7 +82,7 @@ SOCKS5_PROXY: str = _get_setting("SOCKS5_PROXY", "")
 RAW_PROXY_LIST: str = _get_setting("PROXY_LIST", "")
 
 # Browser & Stealth Settings
-HEADLESS_MODE: bool = _get_setting("HEADLESS_MODE", "false").lower() in ("true", "1", "yes")
+HEADLESS_MODE: bool = _get_setting("HEADLESS_MODE", "true").lower() in ("true", "1", "yes")
 NAVIGATION_TIMEOUT_MS: int = int(_get_setting("NAVIGATION_TIMEOUT_MS", "35000"))
 CHEAPEST_TAB_WAIT_MS: int = int(_get_setting("CHEAPEST_TAB_WAIT_MS", "1500"))
 
@@ -196,6 +196,18 @@ def get_proxy_pool() -> list[Optional[str]]:
     if RAW_PROXY_LIST:
         for item in RAW_PROXY_LIST.replace("\n", ",").split(","):
             cleaned = item.strip()
+            if not cleaned:
+                continue
+            # Auto-convert raw "ip:port:user:pass" or "ip:port" export format
+            if not cleaned.startswith(("http://", "https://", "socks5://", "socks4://")):
+                parts = cleaned.split(":")
+                if len(parts) == 4:
+                    ip, port, user, pwd = parts
+                    cleaned = f"http://{user}:{pwd}@{ip}:{port}"
+                elif len(parts) == 2:
+                    ip, port = parts
+                    cleaned = f"http://{ip}:{port}"
+
             if cleaned and cleaned not in candidates:
                 candidates.append(cleaned)
 
@@ -215,9 +227,69 @@ def get_proxy_pool() -> list[Optional[str]]:
     return verified_proxies
 
 
-def get_flight_window_status(outbound_date_val: Any) -> dict[str, Any]:
+def test_proxy_connection(proxy_url: Optional[str] = None, timeout: float = 6.0) -> dict[str, Any]:
     """
-    Evaluate whether a flight outbound date is within the Google Flights
+    Test connectivity, latency, public egress IP, and Google Flights accessibility through a proxy.
+    Returns:
+      {
+        "proxy_url": str,
+        "is_direct": bool,
+        "success": bool,
+        "ip": str,
+        "latency_ms": int,
+        "google_flights_status": int | None,
+        "error": str | None,
+      }
+    """
+    import time
+
+    start_t = time.perf_counter()
+    res: dict[str, Any] = {
+        "proxy_url": proxy_url or "Conexión Directa",
+        "is_direct": proxy_url is None,
+        "success": False,
+        "ip": "Desconocido",
+        "latency_ms": 0,
+        "google_flights_status": None,
+        "error": None,
+    }
+
+    try:
+        try:
+            from curl_cffi import requests as curl_req
+
+            ip_resp = curl_req.get("https://api.ipify.org?format=json", proxy=proxy_url, timeout=timeout)
+            if ip_resp.status_code == 200:
+                res["ip"] = ip_resp.json().get("ip", "Desconocido")
+
+            gf_resp = curl_req.get(
+                "https://www.google.com/travel/flights?curr=MXN&gl=MX&hl=es",
+                proxy=proxy_url,
+                impersonate="chrome",
+                timeout=timeout,
+            )
+            res["google_flights_status"] = gf_resp.status_code
+            res["latency_ms"] = int((time.perf_counter() - start_t) * 1000)
+            res["success"] = gf_resp.status_code == 200
+        except ImportError:
+            import requests as std_req
+
+            proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            ip_resp = std_req.get("https://api.ipify.org?format=json", proxies=proxies_dict, timeout=timeout)
+            if ip_resp.status_code == 200:
+                res["ip"] = ip_resp.json().get("ip", "Desconocido")
+            res["latency_ms"] = int((time.perf_counter() - start_t) * 1000)
+            res["success"] = True
+    except Exception as exc:
+        res["error"] = str(exc)
+        res["latency_ms"] = int((time.perf_counter() - start_t) * 1000)
+
+    return res
+
+
+def get_flight_window_status(outbound_date_val: Any, return_date_val: Any = None) -> dict[str, Any]:
+    """
+    Evaluate whether a flight (and its return date for round trips) is within the Google Flights
     330-day advance schedule release window.
 
     Returns a dict with:
@@ -243,14 +315,32 @@ def get_flight_window_status(outbound_date_val: Any) -> dict[str, Any]:
         }
 
     try:
-        if isinstance(outbound_date_val, (date, datetime)):
-            out_d = outbound_date_val if isinstance(outbound_date_val, date) else outbound_date_val.date()
-        else:
-            clean_str = str(outbound_date_val).strip()[:10]
-            out_d = datetime.strptime(clean_str, "%Y-%m-%d").date()
+        def _parse_d(v: Any) -> Optional[date]:
+            if not v:
+                return None
+            if isinstance(v, (date, datetime)):
+                return v if isinstance(v, date) else v.date()
+            clean = str(v).strip()[:10]
+            return datetime.strptime(clean, "%Y-%m-%d").date()
+
+        out_d = _parse_d(outbound_date_val)
+        ret_d = _parse_d(return_date_val)
+        if out_d is None:
+            return {
+                "status": "UNKNOWN",
+                "is_searchable": False,
+                "days_until_flight": 0,
+                "days_until_release": 0,
+                "release_date": None,
+                "label": "Fecha inválida",
+                "badge": "Desconocido",
+            }
+
+        effective_d = max(out_d, ret_d) if ret_d else out_d
 
         today = date.today()
         days_until_flight = (out_d - today).days
+        days_until_effective = (effective_d - today).days
 
         if days_until_flight < 0:
             return {
@@ -262,8 +352,8 @@ def get_flight_window_status(outbound_date_val: Any) -> dict[str, Any]:
                 "label": "Fecha pasada",
                 "badge": "Expirada",
             }
-        elif days_until_flight > GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS:
-            days_until_release = days_until_flight - GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS
+        elif days_until_effective > GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS:
+            days_until_release = days_until_effective - GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS
             release_date = today + timedelta(days=days_until_release)
             rel_str = release_date.strftime("%d/%m/%Y")
             return {

@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-try:
+if TYPE_CHECKING:
     import requests
-except ImportError:
-    requests = None  # type: ignore[assignment]
+else:
+    try:
+        import requests
+    except ImportError:
+        requests = None
 
 from src.config import (
     DEFAULT_CURRENCY,
@@ -151,16 +154,42 @@ def evaluate_slot_alert_triggers(
         "cheapest_stops": scrape_result.get("cheapest_stops") or "Directo",
         "cheapest_duration": scrape_result.get("cheapest_duration") or "N/A",
         "cheapest_dep_arr": scrape_result.get("cheapest_dep_arr") or "",
+        "origin_airport": scrape_result.get("origin_airport"),
+        "destination_airport": scrape_result.get("destination_airport"),
         "is_self_transfer": is_self_transfer,
         "best_tab_price": best_price,
         "best_airline": scrape_result.get("best_airline") or scrape_result.get("cheapest_airline") or "Aerolínea",
         "best_stops": scrape_result.get("best_stops") or scrape_result.get("cheapest_stops") or "Directo",
         "best_duration": scrape_result.get("best_duration") or scrape_result.get("cheapest_duration") or "N/A",
+        "best_origin_airport": scrape_result.get("best_origin_airport") or scrape_result.get("origin_airport"),
+        "best_destination_airport": scrape_result.get("best_destination_airport") or scrape_result.get("destination_airport"),
         "trigger_type": "+".join(triggers),
         "trigger_badges": " | ".join(trigger_badges),
         "historical_min_price": historical_min,
         "rolling_7d_avg": rolling_7d_avg,
     }
+
+
+def _format_corridor_header_md(raw_origin: str | list[str], raw_dest: str | list[str]) -> str:
+    """
+    Format origin/destination strings or lists into N:M bracketed notation for Telegram headers:
+      'MEX,NLU' and 'NRT,HND' -> '[MEX, NLU] ➔ [NRT, HND]'
+      ['MEX', 'NLU'] and ['NRT', 'HND'] -> '[MEX, NLU] ➔ [NRT, HND]'
+      'MEX' and 'MAD'         -> '[MEX] ➔ [MAD]'
+    """
+    if isinstance(raw_origin, list):
+        orig_parts = [str(p).strip().upper() for p in raw_origin if str(p).strip()]
+    else:
+        orig_parts = [p.strip().upper() for p in str(raw_origin or "MEX").split(",") if p.strip()]
+
+    if isinstance(raw_dest, list):
+        dest_parts = [str(p).strip().upper() for p in raw_dest if str(p).strip()]
+    else:
+        dest_parts = [p.strip().upper() for p in str(raw_dest or "MAD").split(",") if p.strip()]
+
+    orig_fmt = ", ".join(orig_parts) if orig_parts else "MEX"
+    dest_fmt = ", ".join(dest_parts) if dest_parts else "MAD"
+    return f"[{orig_fmt}] ➔ [{dest_fmt}]"
 
 
 def format_consolidated_destination_digest(
@@ -169,9 +198,9 @@ def format_consolidated_destination_digest(
     is_test: bool = False,
 ) -> str:
     """
-    Format ONE consolidated Telegram Markdown digest card for a destination,
-    listing all triggered `date_slots` sorted by `cheapest_tab_price ASC`.
-    Faithfully reports real prices or explicit 330-day release schedule hold (zero fabricated data).
+    Format ONE consolidated Telegram Markdown digest card for an N:M multi-airport destination,
+    listing all triggered `date_slots` sorted by `cheapest_tab_price ASC` and specifying
+    the exact winning airport pair (`origin_airport -> destination_airport`) on each date.
     """
     valid_prices = [
         float(x["cheapest_tab_price"])
@@ -187,17 +216,21 @@ def format_consolidated_destination_digest(
     )
 
     dest_name = _escape_md_text(destination_meta.get("name") or "Ruta Monitoreada")
-    origin = _escape_md_text(destination_meta.get("origin") or "MEX")
-    dest_code = _escape_md_text(destination_meta.get("destination") or destination_meta.get("destination_code") or "MAD")
+    raw_origin = str(destination_meta.get("origin") or "MEX")
+    raw_dest = str(destination_meta.get("destination") or destination_meta.get("destination_code") or "MAD")
+    corridor_header = _format_corridor_header_md(raw_origin, raw_dest)
     currency = _escape_md_text(destination_meta.get("currency") or DEFAULT_CURRENCY)
     target_price = float(destination_meta.get("target_price") or 0.0)
+
+    default_single_orig = raw_origin.split(",")[0].strip().upper() if "," not in raw_origin else ""
+    default_single_dest = raw_dest.split(",")[0].strip().upper() if "," not in raw_dest else ""
 
     header_prefix = "*REPORTE DE ESTADO — FLIGHTPULSE MATRIX*" if is_test else "*ALERTA DE VUELOS — FLIGHTPULSE MATRIX*"
     lowest_price_str = f"${min(valid_prices):,.0f} {currency}" if valid_prices else "En espera de liberación (330d)"
 
     lines: list[str] = [
         f"{header_prefix}",
-        f"*{dest_name}* ({origin} -> {dest_code})",
+        f"*{dest_name}* ({corridor_header})",
         f"*Precio Meta:* ${target_price:,.0f} {currency} | *Mejor Precio:* {lowest_price_str}",
         f"*{len(sorted_slots)} fecha(s) verificadas en este reporte:*",
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -241,25 +274,31 @@ def format_consolidated_destination_digest(
             c_airline = _escape_md_text(slot.get("cheapest_airline") or "Aerolínea")
             c_stops = _escape_md_text(slot.get("cheapest_stops") or "Directo")
             c_duration = _escape_md_text(slot.get("cheapest_duration") or "N/A")
+            c_orig = _escape_md_text(slot.get("origin_airport") or default_single_orig)
+            c_dest = _escape_md_text(slot.get("destination_airport") or default_single_dest)
+            c_route_part = f", {c_orig} -> {c_dest}" if (c_orig and c_dest) else ""
             self_transfer_badge = " [Self-Transfer / Boletos separados]" if slot.get("is_self_transfer") else ""
 
             b_price = float(slot.get("best_tab_price") or c_price)
             b_airline = _escape_md_text(slot.get("best_airline") or c_airline)
             b_stops = _escape_md_text(slot.get("best_stops") or c_stops)
             b_duration = _escape_md_text(slot.get("best_duration") or c_duration)
+            b_orig = _escape_md_text(slot.get("best_origin_airport") or c_orig)
+            b_dest = _escape_md_text(slot.get("best_destination_airport") or c_dest)
+            b_route_part = f", {b_orig} -> {b_dest}" if (b_orig and b_dest) else ""
 
             lines.extend(
                 [
                     f"*{idx}.* *Fechas:* {date_pair_str} — _{slot_label}_",
                     f"   Estado: {badges}",
-                    f"   *Más Baratos:* ${c_price:,.0f} {currency} ({c_airline}, {c_stops}, {c_duration}){self_transfer_badge}",
-                    f"   *Mejores Vuelos:* ${b_price:,.0f} {currency} ({b_airline}, {b_stops}, {b_duration})",
+                    f"   *Más Baratos:* ${c_price:,.0f} {currency} ({c_airline}{c_route_part}, {c_stops}, {c_duration}){self_transfer_badge}",
+                    f"   *Mejores Vuelos:* ${b_price:,.0f} {currency} ({b_airline}{b_route_part}, {b_stops}, {b_duration})",
                     f"   [Reservar en Google Flights]({url})",
                     "",
                 ]
             )
 
-    lines.append("_FlightPulse Matrix v4.0 • Rastreo verificado sin datos simulados_")
+    lines.append("_FlightPulse Matrix v4.0 • Rastreo N:M verificado sin datos simulados_")
     return "\n".join(lines)
 
 
@@ -269,6 +308,11 @@ def send_telegram_message(markdown_text: str) -> tuple[bool, str]:
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         msg = "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured."
+        logger.warning(msg)
+        return False, msg
+
+    if requests is None:
+        msg = "The 'requests' module is not installed."
         logger.warning(msg)
         return False, msg
 
@@ -388,7 +432,8 @@ def send_test_digest_alert(destination_id: Optional[int] = None) -> tuple[bool, 
 
         is_future = win_info.get("status") == "FUTURE_RELEASE"
         days_rel = win_info.get("days_until_release", 0)
-        rel_date_str = win_info.get("release_date").strftime("%d/%m/%Y") if win_info.get("release_date") else ""
+        rel_date_val = win_info.get("release_date")
+        rel_date_str = rel_date_val.strftime("%d/%m/%Y") if rel_date_val is not None else ""
 
         if is_future:
             trigger_badge = f"[En espera: apertura {rel_date_str}]"
@@ -408,11 +453,15 @@ def send_test_digest_alert(destination_id: Optional[int] = None) -> tuple[bool, 
                 "cheapest_airline": airline,
                 "cheapest_stops": stops,
                 "cheapest_duration": duration,
+                "origin_airport": s.get("latest_origin_airport"),
+                "destination_airport": s.get("latest_destination_airport"),
                 "is_self_transfer": is_self,
                 "best_tab_price": b_price,
                 "best_airline": airline,
                 "best_stops": stops,
                 "best_duration": duration,
+                "best_origin_airport": s.get("latest_best_origin_airport") or s.get("latest_origin_airport"),
+                "best_destination_airport": s.get("latest_best_destination_airport") or s.get("latest_destination_airport"),
                 "trigger_type": "TEST_DIGEST",
                 "trigger_badges": trigger_badge,
                 "is_future_release": is_future,
