@@ -10,7 +10,7 @@ import os
 import socket
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 try:

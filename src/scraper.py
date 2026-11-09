@@ -165,11 +165,33 @@ class PooledPatchrightSession:
                     "Chrome channel unavailable (%s); falling back to bundled Patchright Chromium.",
                     exc2,
                 )
-                self._browser = self._pw.chromium.launch(
-                    headless=True,
-                    args=launch_Args,
-                    proxy=proxy_cfg,
-                )
+                try:
+                    self._browser = self._pw.chromium.launch(
+                        headless=True,
+                        args=launch_Args,
+                        proxy=proxy_cfg,
+                    )
+                except Exception as exc3:
+                    err_msg = str(exc3)
+                    if "Executable doesn't exist" in err_msg or "patchright install" in err_msg:
+                        logger.info(
+                            "Patchright Chromium binary missing (%s). Running 'patchright install chromium' automatically...",
+                            err_msg[:80],
+                        )
+                        import subprocess
+                        import sys
+                        subprocess.run(
+                            [sys.executable, "-m", "patchright", "install", "chromium"],
+                            check=True,
+                            timeout=180,
+                        )
+                        self._browser = self._pw.chromium.launch(
+                            headless=True,
+                            args=launch_Args,
+                            proxy=proxy_cfg,
+                        )
+                    else:
+                        raise
 
         self._context = self._browser.new_context(
             no_viewport=True,

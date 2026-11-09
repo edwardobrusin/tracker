@@ -17,7 +17,12 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import hmac
+import sys
 from typing import Any, Optional
+
+# Hot-reload safety for Streamlit Cloud: purge cached in-memory src modules on rerun
+for _mod in [m for m in list(sys.modules.keys()) if m == "src" or m.startswith("src.")]:
+    sys.modules.pop(_mod, None)
 
 import pandas as pd
 import plotly.express as px
@@ -254,7 +259,7 @@ def check_password_gate() -> bool:
                 type="password",
                 placeholder="Ingresa tu contraseña...",
             )
-            submitted = st.form_submit_button("Desbloquear Control Center", use_container_width=True)
+            submitted = st.form_submit_button("Desbloquear Control Center", width="stretch")
             if submitted:
                 if hmac.compare_digest(pwd_input.strip(), APP_PASSWORD.strip()):
                     st.session_state["authenticated"] = True
@@ -550,7 +555,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
 
     st.dataframe(
         df_matrix[display_cols],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Fecha / Tramo": st.column_config.TextColumn("Fecha / Tramo", width="medium"),
@@ -619,7 +624,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
             yaxis_title="Precio (MXN)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
     else:
         st.info("Las fechas seleccionadas aún no cuentan con cotizaciones históricas registradas.")
 
@@ -694,7 +699,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                 height=420,
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_multi, use_container_width=True)
+            st.plotly_chart(fig_multi, width="stretch")
         else:
             slot_choices = [
                 (int(s["id"]), s.get("label") or f"{s.get('outbound_date')} ➔ {s.get('return_date')}")
@@ -750,7 +755,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                     height=420,
                     hovermode="x unified",
                 )
-                st.plotly_chart(fig_dual, use_container_width=True)
+                st.plotly_chart(fig_dual, width="stretch")
 
     # --------------------------------------------------------------------------
     # DESTINATION & SLOTS MANAGEMENT DRAWER
@@ -765,7 +770,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
             with d_col2:
                 new_state = not bool(selected_dest.get("is_active", True))
                 btn_lbl = "Reactivar Destino" if new_state else "Pausar Destino"
-                if st.button(btn_lbl, key=f"toggle_dest_{selected_dest['id']}", use_container_width=True):
+                if st.button(btn_lbl, key=f"toggle_dest_{selected_dest['id']}", width="stretch"):
                     try:
                         set_destination_active(int(selected_dest["id"]), new_state)
                         st.success("Estado del destino actualizado.")
@@ -777,7 +782,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                     "Eliminar Destino Completo",
                     key=f"del_dest_{selected_dest['id']}",
                     type="secondary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     delete_destination(int(selected_dest["id"]))
                     st.success("Destino y sus slots eliminados.")
@@ -800,7 +805,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                 if st.button(
                     "Activar" if toggle_slot_state else "Pausar",
                     key=f"tog_slot_{s['id']}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         set_date_slot_active(int(s["id"]), toggle_slot_state)
@@ -808,7 +813,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                     except Exception as exc:
                         st.error(str(exc))
             with sc4:
-                if st.button("Borrar", key=f"del_slot_{s['id']}", use_container_width=True):
+                if st.button("Borrar", key=f"del_slot_{s['id']}", width="stretch"):
                     delete_date_slot(int(s["id"]))
                     st.rerun()
 
@@ -999,7 +1004,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         submit_btn_text = (
             "Actualizar Perfil del Destino" if editing_dest_id is not None else "Crear Destino en Matrix"
         )
-        submitted_dest = st.form_submit_button(submit_btn_text, use_container_width=True)
+        submitted_dest = st.form_submit_button(submit_btn_text, width="stretch")
 
         if submitted_dest:
             merged_airlines = list(selected_airlines)
@@ -1204,7 +1209,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
 
                 b_add, b_shift7 = st.columns([1.2, 1])
                 with b_add:
-                    if st.button(add_btn_txt, disabled=not can_add, key="btn_add_staged", type="primary", use_container_width=True):
+                    if st.button(add_btn_txt, disabled=not can_add, key="btn_add_staged", type="primary", width="stretch"):
                         if any(s["outbound_date"] == out_str and s.get("return_date") == ret_str for s in staged_slots):
                             st.warning("Esta combinación ya fue agregada a la lista.")
                         else:
@@ -1228,7 +1233,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                             })
                             st.rerun()
                 with b_shift7:
-                    if st.button("+7 Días Rápido", disabled=not can_add, key="btn_shift_7", use_container_width=True):
+                    if st.button("+7 Días Rápido", disabled=not can_add, key="btn_shift_7", width="stretch"):
                         shift_out = range_start + datetime.timedelta(days=7)
                         shift_ret = (range_end + datetime.timedelta(days=7)) if range_end else None
                         s_out_str = shift_out.strftime("%Y-%m-%d")
@@ -1261,7 +1266,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         with tray_h1:
             st.markdown(f"##### Fechas Seleccionadas para Guardar ({len(staged_slots)} / {MAX_SLOTS_PER_DESTINATION})")
         with tray_h2:
-            if staged_slots and st.button("Limpiar Todo", key="btn_clear_staged", use_container_width=True):
+            if staged_slots and st.button("Limpiar Todo", key="btn_clear_staged", width="stretch"):
                 st.session_state["staged_slots_list"] = []
                 st.rerun()
 
@@ -1290,7 +1295,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 f"Guardar estas {len(staged_slots)} Fecha(s) en '{target_dest['name']}'",
                 key="save_staged_slots_btn",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     inserted = bulk_create_date_slots(
@@ -1385,14 +1390,14 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 })
             st.dataframe(
                 pd.DataFrame(preview_display),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             if st.button(
                 f"Guardar estas {len(generated_preview)} Fechas en '{target_dest['name']}'",
                 key="save_opta_btn",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     inserted = bulk_create_date_slots(
@@ -1453,14 +1458,14 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     })
                 st.dataframe(
                     pd.DataFrame(display_pasted),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
                 if st.button(
                     f"Guardar {len(parsed_url_slots)} URL(s) en '{target_dest['name']}'",
                     key="save_optc_btn",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         inserted = bulk_create_date_slots(
@@ -1547,7 +1552,7 @@ def render_tab3_scanner_and_logs(
                 key="tab3_batch_slider",
             )
 
-        if st.button("Iniciar Escaneo Dual-Tab Ahora", type="primary", use_container_width=True):
+        if st.button("Iniciar Escaneo Dual-Tab Ahora", type="primary", width="stretch"):
             progress_bar = st.progress(0, text="Inicializando navegador stealth y validando ventana...")
             status_box = st.empty()
 
@@ -1582,7 +1587,7 @@ def render_tab3_scanner_and_logs(
             if run_summary.get("results"):
                 st.dataframe(
                     pd.DataFrame(run_summary["results"]),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -1606,7 +1611,7 @@ def render_tab3_scanner_and_logs(
             format_func=lambda x: str(x[1]),
             key="tab3_tg_dest",
         )
-        if st.button("Enviar Tarjeta Digest de Prueba a Telegram", use_container_width=True):
+        if st.button("Enviar Tarjeta Digest de Prueba a Telegram", width="stretch"):
             with st.spinner("Verificando datos y enviando reporte a Telegram..."):
                 ok, detail, md_preview = send_test_digest_alert(destination_id=tg_sel[0])
             if ok:
@@ -1641,8 +1646,8 @@ def render_tab3_scanner_and_logs(
                 height=300,
                 margin=dict(l=10, r=10, t=40, b=10),
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
-            st.dataframe(df_src, use_container_width=True, hide_index=True)
+            st.plotly_chart(fig_pie, width="stretch")
+            st.dataframe(df_src, width="stretch", hide_index=True)
         else:
             st.info("Sin registros de extracción en los últimos 7 días.")
 
@@ -1665,7 +1670,7 @@ def render_tab3_scanner_and_logs(
             ]
             st.dataframe(
                 df_logs[display_log_cols],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -1695,7 +1700,7 @@ def render_tab3_scanner_and_logs(
             )
         with test_col2:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            run_proxy_check = st.button("Verificar Conexión de Red", key="btn_run_proxy_check", use_container_width=True)
+            run_proxy_check = st.button("Verificar Conexión de Red", key="btn_run_proxy_check", width="stretch")
 
         if run_proxy_check:
             targets_to_test = list(pool)
@@ -1713,7 +1718,7 @@ def render_tab3_scanner_and_logs(
                         "Latencia": f"{res['latency_ms']} ms",
                         "Acceso a Google Flights": status_desc,
                     })
-            st.dataframe(pd.DataFrame(results_list), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(results_list), width="stretch", hide_index=True)
 
 
 # ==============================================================================
@@ -1741,9 +1746,9 @@ def main() -> None:
             """
         )
         st.markdown("---")
-        if st.button("Refrescar Datos", use_container_width=True):
+        if st.button("Refrescar Datos", width="stretch"):
             st.rerun()
-        if st.button("Cerrar Sesión", use_container_width=True):
+        if st.button("Cerrar Sesión", width="stretch"):
             st.session_state["authenticated"] = False
             st.rerun()
 
