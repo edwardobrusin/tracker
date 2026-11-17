@@ -104,6 +104,55 @@ def format_playwright_proxy(proxy_url: Optional[str]) -> Optional[dict[str, str]
         return {"server": proxy_url}
 
 
+def _extract_expected_corridor_iatas(url: str) -> tuple[set[str], set[str]]:
+    """Decode expected origin and destination IATA sets from a Google Flights URL's `?tfs=` parameter."""
+    try:
+        qs_tfs = parse_qs(urlparse(url).query).get("tfs", [""])[0]
+        if not qs_tfs:
+            return set(), set()
+        dec = decode_tfs_parameter(qs_tfs)
+        origins = {c.strip().upper() for c in (dec.get("origins") or []) if c and len(c.strip()) == 3}
+        destinations = {c.strip().upper() for c in (dec.get("destinations") or []) if c and len(c.strip()) == 3}
+        return origins, destinations
+    except Exception:
+        return set(), set()
+
+
+def _filter_offers_for_corridor(
+    offers: list[FlightOffer],
+    expected_origins: set[str],
+    expected_destinations: set[str],
+) -> list[FlightOffer]:
+    """Filter out offers whose detected origin or destination IATA falls outside the expected corridor."""
+    if not offers:
+        return []
+    if not expected_origins and not expected_destinations:
+        return list(offers)
+    filtered: list[FlightOffer] = []
+    for offer in offers:
+        if expected_origins and offer.origin_airport and offer.origin_airport.upper() not in expected_origins:
+            continue
+        if expected_destinations and offer.destination_airport and offer.destination_airport.upper() not in expected_destinations:
+            continue
+        filtered.append(offer)
+    return filtered
+
+
+def _is_proxy_or_tunnel_error(exc: Exception) -> bool:
+    """Return True if an exception indicates a proxy/tunnel failure (e.g. FortiGate 403 or unreachable proxy)."""
+    msg = str(exc).upper()
+    markers = (
+        "ERR_PROXY_CONNECTION_FAILED",
+        "ERR_TUNNEL_CONNECTION_FAILED",
+        "ERR_PROXY_AUTH",
+        "ERR_PROXY_TUNNEL_BLOCKED",
+        "403",
+        "FORTIGATE",
+        "PROXY",
+    )
+    return any(m in msg for m in markers)
+
+
 class PooledPatchrightSession:
     """
     Pooled `patchright` Chrome session bound to a single proxy (or direct connection).
@@ -117,12 +166,9 @@ class PooledPatchrightSession:
         self._browser: Any = None
         self._context: Any = None
 
-    def start(self) -> "PooledPatchrightSession":
-        """Start Patchright and create a stealth browser context with route blocking."""
-        from patchright.sync_api import sync_playwright
-
-        self._pw = sync_playwright().start()
-        launch_Args = [
+    def _launch_browser_and_context(self) -> None:
+        """Launch Chromium/Chrome and bind a fresh stealth context with route blocking."""
+        launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
             "--no-first-run",
@@ -139,7 +185,7 @@ class PooledPatchrightSession:
             self._browser = self._pw.chromium.launch(
                 channel="chrome",
                 headless=self.headless,
-                args=launch_Args,
+                args=launch_args,
                 proxy=proxy_cfg,
             )
             logger.info(
@@ -157,7 +203,7 @@ class PooledPatchrightSession:
                 self._browser = self._pw.chromium.launch(
                     channel="chrome",
                     headless=True,
-                    args=launch_Args,
+                    args=launch_args,
                     proxy=proxy_cfg,
                 )
             except Exception as exc2:
@@ -168,7 +214,7 @@ class PooledPatchrightSession:
                 try:
                     self._browser = self._pw.chromium.launch(
                         headless=True,
-                        args=launch_Args,
+                        args=launch_args,
                         proxy=proxy_cfg,
                     )
                 except Exception as exc3:
@@ -187,7 +233,7 @@ class PooledPatchrightSession:
                         )
                         self._browser = self._pw.chromium.launch(
                             headless=True,
-                            args=launch_Args,
+                            args=launch_args,
                             proxy=proxy_cfg,
                         )
                     else:
@@ -200,6 +246,30 @@ class PooledPatchrightSession:
         )
         self._context.add_cookies(GOOGLE_CONSENT_COOKIES)
         self._context.route("**/*", self._handle_route)
+
+    def _switch_to_direct_in_place(self) -> None:
+        """Close a failing proxy browser and re-open one reusable direct browser on this session."""
+        logger.warning(
+            "Proxy %s failed or was blocked; switching pooled browser session in-place to direct connection.",
+            self.proxy_url,
+        )
+        for resource in (self._context, self._browser):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+        self._context = None
+        self._browser = None
+        self.proxy_url = None
+        self._launch_browser_and_context()
+
+    def start(self) -> "PooledPatchrightSession":
+        """Start Patchright and create a stealth browser context with route blocking."""
+        from patchright.sync_api import sync_playwright
+
+        self._pw = sync_playwright().start()
+        self._launch_browser_and_context()
         return self
 
     def _handle_route(self, route: Any) -> None:
@@ -244,12 +314,10 @@ class PooledPatchrightSession:
         """
         offers: list[FlightOffer] = []
 
-        # Primary selector for Google Flights itinerary list items: `li.pIav2d`, fallback `[role="listitem"]`
+        # Strictly query Google Flights itinerary list items (`li.pIav2d`) so landing-page
+        # promo cards and passenger selector rows (`div[role="listitem"]`) are never parsed.
         card_locators = page.locator("li.pIav2d")
         count = card_locators.count()
-        if count == 0:
-            card_locators = page.locator('ul[role="list"] > li, div[role="listitem"]')
-            count = card_locators.count()
 
         limit = min(count, max_cards * 2)
         for idx in range(limit):
@@ -312,14 +380,9 @@ class PooledPatchrightSession:
         except Exception:
             pass
 
-    def scrape_slot_in_browser(self, url: str) -> Optional[SlotScrapeResult]:
-        """
-        Execute Layer 1 (`AF_initDataCallback` `ds:1` + `GetShoppingResults` RPC listener)
-        and Layer 2 (Best Tab DOM + Cheapest Tab click & DOM extraction) on `url`.
-        """
-        if not self._context:
-            self.start()
-
+    def _scrape_slot_once(self, url: str) -> Optional[SlotScrapeResult]:
+        """Run a single browser page navigation and dual-tab extraction on `self._context`."""
+        expected_origins, expected_destinations = _extract_expected_corridor_iatas(url)
         page = self._context.new_page()
         rpc_cheapest_offers: list[FlightOffer] = []
 
@@ -340,21 +403,49 @@ class PooledPatchrightSession:
             page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
             self._dismiss_consent_if_present(page)
 
-            # Wait for initial flight cards (`li.pIav2d`) to hydrate
+            if self.proxy_url is not None:
+                cur_url = (page.url or "").lower()
+                if cur_url.startswith("chrome-error://") or cur_url == "about:blank":
+                    raise RuntimeError(f"ERR_PROXY_TUNNEL_BLOCKED: landed on {page.url}")
+
+            # Wait up to 5s for real itinerary cards (`li.pIav2d`)
             try:
-                page.wait_for_selector("li.pIav2d, .YMlIz", timeout=15000)
+                page.wait_for_selector("li.pIav2d", timeout=5000)
             except Exception:
-                # If still not ready after 15s, check if transient reload button appears
-                reload_btn = page.locator("button:has-text('Volver a cargar'), button:has-text('Retry'), button:has-text('Reload')").first
-                if reload_btn.count() > 0 and reload_btn.is_visible():
-                    logger.debug("Google Flights showed transient reload prompt after timeout. Clicking reload button...")
+                if self.proxy_url is not None:
+                    body_snippet = ""
                     try:
-                        reload_btn.click(timeout=3000)
-                        page.wait_for_selector("li.pIav2d, .YMlIz", timeout=10000)
+                        body_snippet = page.content()[:2500].lower()
                     except Exception:
+                        pass
+                    if "fortigate" in body_snippet or "proxy.http" in body_snippet:
+                        raise RuntimeError("ERR_PROXY_TUNNEL_BLOCKED: FortiGate blocked Proxy.HTTP")
+
+                # If Google Flights rendered the search/explore landing page with Buscar/Search unclicked, click it
+                try:
+                    search_btn = page.get_by_role(
+                        "button",
+                        name=re.compile(r"^Buscar$|^Search$", re.I),
+                    ).first
+                    if search_btn.count() > 0 and search_btn.is_visible():
+                        search_btn.click(timeout=3000)
+                        page.wait_for_selector("li.pIav2d", timeout=12000)
+                except Exception:
+                    pass
+
+                if page.locator("li.pIav2d").count() == 0:
+                    reload_btn = page.locator(
+                        "button:has-text('Volver a cargar'), button:has-text('Retry'), button:has-text('Reload')"
+                    ).first
+                    if reload_btn.count() > 0 and reload_btn.is_visible():
+                        logger.debug("Google Flights showed transient reload prompt after timeout. Clicking reload button...")
+                        try:
+                            reload_btn.click(timeout=3000)
+                            page.wait_for_selector("li.pIav2d", timeout=10000)
+                        except Exception:
+                            page.wait_for_timeout(1500)
+                    else:
                         page.wait_for_timeout(1500)
-                else:
-                    page.wait_for_timeout(1500)
 
             # ------------------------------------------------------------------
             # LAYER 1A: Parse inline SSR `AF_initDataCallback({key: 'ds:1'})`
@@ -365,7 +456,11 @@ class PooledPatchrightSession:
             # ------------------------------------------------------------------
             # LAYER 2A: Extract initial "Best" (`Mejores`) Tab cards from DOM
             # ------------------------------------------------------------------
-            best_dom_offers = self._extract_dom_cards(page, tab_source="best", max_cards=3)
+            best_dom_offers = _filter_offers_for_corridor(
+                self._extract_dom_cards(page, tab_source="best", max_cards=3),
+                expected_origins,
+                expected_destinations,
+            )
 
             # ------------------------------------------------------------------
             # LAYER 2B: Click "Cheapest" (`Más baratos` / `Cheapest`) Tab
@@ -394,27 +489,43 @@ class PooledPatchrightSession:
                 # Wait 1,500ms for Google Flights list re-ordering / RPC hydration
                 page.wait_for_timeout(CHEAPEST_TAB_WAIT_MS)
 
-            cheapest_dom_offers = self._extract_dom_cards(page, tab_source="cheapest", max_cards=3)
+            cheapest_dom_offers = _filter_offers_for_corridor(
+                self._extract_dom_cards(page, tab_source="cheapest", max_cards=3),
+                expected_origins,
+                expected_destinations,
+            )
+            filtered_rpc_offers = _filter_offers_for_corridor(
+                rpc_cheapest_offers,
+                expected_origins,
+                expected_destinations,
+            )
+            ds1_offers: list[FlightOffer] = []
+            ds1_best: Optional[FlightOffer] = None
+            if ds1_extraction:
+                ds1_raw = [ds1_extraction.cheapest_offer, *ds1_extraction.top_offers]
+                ds1_offers = _filter_offers_for_corridor(ds1_raw, expected_origins, expected_destinations)
+                if ds1_extraction.best_offer:
+                    best_filtered = _filter_offers_for_corridor(
+                        [ds1_extraction.best_offer], expected_origins, expected_destinations
+                    )
+                    ds1_best = best_filtered[0] if best_filtered else None
 
             # ------------------------------------------------------------------
             # MERGE & SELECT BEST + CHEAPEST OFFERS ACROSS LAYER 1 & LAYER 2
             # ------------------------------------------------------------------
-            # 1. Determine Best Tab Offer
             best_offer: Optional[FlightOffer] = None
             if best_dom_offers:
                 best_offer = best_dom_offers[0]
-            elif ds1_extraction and ds1_extraction.best_offer:
-                best_offer = ds1_extraction.best_offer
+            elif ds1_best:
+                best_offer = ds1_best
 
-            # 2. Determine Cheapest Tab Offer (prioritize Cheapest Tab DOM + RPC + ds:1 minimum)
             cheapest_candidates: list[FlightOffer] = []
             if cheapest_dom_offers:
                 cheapest_candidates.extend(cheapest_dom_offers)
-            if rpc_cheapest_offers:
-                cheapest_candidates.extend(rpc_cheapest_offers)
-            if ds1_extraction:
-                cheapest_candidates.append(ds1_extraction.cheapest_offer)
-                cheapest_candidates.extend(ds1_extraction.top_offers)
+            if filtered_rpc_offers:
+                cheapest_candidates.extend(filtered_rpc_offers)
+            if ds1_offers:
+                cheapest_candidates.extend(ds1_offers)
             if best_dom_offers:
                 cheapest_candidates.extend(best_dom_offers)
 
@@ -430,26 +541,15 @@ class PooledPatchrightSession:
             # Determine primary extraction_source tag for telemetry
             if cheapest_dom_offers or best_dom_offers:
                 source_tag = "patchright_dom"
-            elif rpc_cheapest_offers:
+            elif filtered_rpc_offers:
                 source_tag = "patchright_rpc"
             else:
                 source_tag = "patchright_ds1"
 
             top_3_dicts = [o.to_dict() for o in cheapest_candidates[:3]]
 
-            # Fallback to decoded single-airport IATA if the corridor was 1:1 and DOM card omitted it
-            fallback_orig: Optional[str] = None
-            fallback_dest: Optional[str] = None
-            try:
-                qs_tfs = parse_qs(urlparse(url).query).get("tfs", [""])[0]
-                if qs_tfs:
-                    dec = decode_tfs_parameter(qs_tfs)
-                    if len(dec.get("origins") or []) == 1:
-                        fallback_orig = dec["origins"][0]
-                    if len(dec.get("destinations") or []) == 1:
-                        fallback_dest = dec["destinations"][0]
-            except Exception:
-                pass
+            fallback_orig = next(iter(expected_origins)) if len(expected_origins) == 1 else None
+            fallback_dest = next(iter(expected_destinations)) if len(expected_destinations) == 1 else None
 
             c_orig = cheapest_offer.origin_airport or fallback_orig
             c_dest = cheapest_offer.destination_airport or fallback_dest
@@ -479,6 +579,27 @@ class PooledPatchrightSession:
                 page.close()
             except Exception:
                 pass
+
+    def scrape_slot_in_browser(self, url: str) -> Optional[SlotScrapeResult]:
+        """
+        Execute Layer 1 (`AF_initDataCallback` `ds:1` + `GetShoppingResults` RPC listener)
+        and Layer 2 (Best Tab DOM + Cheapest Tab click & DOM extraction) on `url`.
+        If the bound proxy fails or is blocked, switches this pooled session in-place to
+        a reusable direct browser so subsequent slots do not relaunch Chrome per slot.
+        """
+        if not self._context:
+            self.start()
+
+        try:
+            return self._scrape_slot_once(url)
+        except Exception as exc:
+            if self.proxy_url is not None and _is_proxy_or_tunnel_error(exc):
+                self._switch_to_direct_in_place()
+                res = self._scrape_slot_once(url)
+                if res:
+                    res.extraction_source = "patchright_direct_fallback"
+                return res
+            raise
 
     def scrape_slot_direct_fallback(self, url: str) -> Optional[SlotScrapeResult]:
         """
@@ -613,8 +734,22 @@ def scrape_via_curl_cffi_ssr(
         if not extraction:
             return None
 
-        cheapest = extraction.cheapest_offer
-        best = extraction.best_offer or cheapest
+        expected_origins, expected_destinations = _extract_expected_corridor_iatas(url)
+        filtered_top = _filter_offers_for_corridor(
+            [extraction.cheapest_offer, *extraction.top_offers],
+            expected_origins,
+            expected_destinations,
+        )
+        if not filtered_top:
+            return None
+        filtered_top.sort(key=lambda o: o.price)
+        cheapest = filtered_top[0]
+        best_filtered = (
+            _filter_offers_for_corridor([extraction.best_offer], expected_origins, expected_destinations)
+            if extraction.best_offer
+            else []
+        )
+        best = best_filtered[0] if best_filtered else cheapest
 
         return SlotScrapeResult(
             cheapest_tab_price=cheapest.price,
@@ -632,7 +767,7 @@ def scrape_via_curl_cffi_ssr(
             best_origin_airport=best.origin_airport or cheapest.origin_airport,
             best_destination_airport=best.destination_airport or cheapest.destination_airport,
             extraction_source="curl_cffi_ssr",
-            raw_top_offers=[o.to_dict() for o in extraction.top_offers[:3]],
+            raw_top_offers=[o.to_dict() for o in filtered_top[:3]],
         )
     except Exception as exc:
         logger.warning("Layer 3A (curl_cffi SSR) failed for %s: %s", url[:80], exc)
@@ -786,47 +921,50 @@ def scrape_date_slot(
 
     if session_to_use is not None:
         try:
-            browser_result = session_to_use.scrape_slot_in_browser(url)
-            if browser_result and browser_result.cheapest_tab_price > 0:
-                elapsed = time.perf_counter() - start_ts
-                logger.info(
-                    "Scraped slot via %s in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
-                    browser_result.extraction_source,
-                    elapsed,
-                    browser_result.cheapest_tab_price,
-                    browser_result.cheapest_airline,
-                    browser_result.best_tab_price or browser_result.cheapest_tab_price,
-                )
-                return browser_result
-        except Exception as browser_exc:
-            logger.warning(
-                "Patchright browser extraction on %s encountered error (%s); trying direct fallback.",
-                proxy_url or "direct",
-                browser_exc,
-            )
-
-        # Tier 2B: Direct fallback on existing Playwright engine if proxy yielded 0 results or failed
-        if proxy_url is not None:
             try:
-                direct_res = session_to_use.scrape_slot_direct_fallback(url)
-                if direct_res and direct_res.cheapest_tab_price > 0:
+                browser_result = session_to_use.scrape_slot_in_browser(url)
+                if browser_result and browser_result.cheapest_tab_price > 0:
                     elapsed = time.perf_counter() - start_ts
                     logger.info(
-                        "Scraped slot via direct browser fallback in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
+                        "Scraped slot via %s in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
+                        browser_result.extraction_source,
                         elapsed,
-                        direct_res.cheapest_tab_price,
-                        direct_res.cheapest_airline,
-                        direct_res.best_tab_price or direct_res.cheapest_tab_price,
+                        browser_result.cheapest_tab_price,
+                        browser_result.cheapest_airline,
+                        browser_result.best_tab_price or browser_result.cheapest_tab_price,
                     )
-                    return direct_res
-            except Exception as direct_exc:
-                logger.debug("Direct browser fallback error: %s", direct_exc)
+                    return browser_result
+            except Exception as browser_exc:
+                logger.warning(
+                    "Patchright browser extraction on %s encountered error (%s); trying direct fallback.",
+                    session_to_use.proxy_url or "direct",
+                    browser_exc,
+                )
 
-        if own_session and session_to_use is not None:
-            try:
-                session_to_use.close()
-            except Exception:
-                pass
+            # Tier 2B: Switch pooled session in-place to direct if proxy yielded 0 results or failed
+            if session_to_use.proxy_url is not None:
+                try:
+                    session_to_use._switch_to_direct_in_place()
+                    direct_res = session_to_use._scrape_slot_once(url)
+                    if direct_res and direct_res.cheapest_tab_price > 0:
+                        direct_res.extraction_source = "patchright_direct_fallback"
+                        elapsed = time.perf_counter() - start_ts
+                        logger.info(
+                            "Scraped slot via direct browser fallback in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
+                            elapsed,
+                            direct_res.cheapest_tab_price,
+                            direct_res.cheapest_airline,
+                            direct_res.best_tab_price or direct_res.cheapest_tab_price,
+                        )
+                        return direct_res
+                except Exception as direct_exc:
+                    logger.debug("Direct browser fallback error: %s", direct_exc)
+        finally:
+            if own_session and session_to_use is not None:
+                try:
+                    session_to_use.close()
+                except Exception:
+                    pass
 
     # Tier 3A: curl_cffi TLS-impersonated SSR `ds:1` extraction (with proxy, then direct fallback)
     ssr_result = scrape_via_curl_cffi_ssr(url, proxy_url=proxy_url)

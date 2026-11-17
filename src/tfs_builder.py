@@ -379,67 +379,17 @@ def encode_tfs_protobuf(
 
     origin_list = parse_iata_list(origin, expand_metro=True)
     destination_list = parse_iata_list(destination, expand_metro=True)
-    is_multi_airport = len(origin_list) > 1 or len(destination_list) > 1
 
     is_one_way = trip_type.strip().lower() in ("one-way", "one_way", "oneway") or not return_date
     trip_enum = 2 if is_one_way else 1
     seat_enum = CABIN_MAP.get(profile.seat.lower(), 1)
     adults_count = max(1, min(9, int(profile.adults)))
 
-    has_advanced_filters = bool(
-        is_multi_airport
-        or profile.airlines
-        or profile.carry_on_bags > 0
-        or profile.dep_start_hour > 0
-        or profile.dep_end_hour < 23
-        or profile.arr_start_hour > 0
-        or profile.arr_end_hour < 23
-        or profile.ret_dep_start_hour > 0
-        or profile.ret_dep_end_hour < 23
-        or profile.ret_arr_start_hour > 0
-        or profile.ret_arr_end_hour < 23
-    )
-
-    # Attempt fast-flights TFSData helper only when 1:1 single airport and no advanced filters
-    if not has_advanced_filters:
-        try:
-            from fast_flights import FlightQuery, Passengers, create_filter
-
-            ff_flights = [
-                FlightQuery(
-                    date=outbound_date.strip(),
-                    from_airport=origin_list[0],
-                    to_airport=destination_list[0],
-                    max_stops=profile.max_stops,
-                )
-            ]
-            if not is_one_way and return_date:
-                ff_flights.append(
-                    FlightQuery(
-                        date=return_date.strip(),
-                        from_airport=destination_list[0],
-                        to_airport=origin_list[0],
-                        max_stops=profile.max_stops,
-                    )
-                )
-            ff_filter = create_filter(
-                flights=ff_flights,
-                trip="one-way" if is_one_way else "round-trip",
-                seat=profile.seat if profile.seat in ("economy", "premium-economy", "business", "first") else "economy",
-                passengers=Passengers(adults=adults_count),
-                max_stops=profile.max_stops,
-            )
-            b64_str = ff_filter.to_str().rstrip("=")
-            if b64_str:
-                return b64_str
-        except Exception:
-            pass
-
     root = bytearray()
     # Field 1: version = 28
     root.extend(_encode_varint_field(1, 28))
-    # Field 2: trip type (1 = round-trip, 2 = one-way)
-    root.extend(_encode_varint_field(2, trip_enum))
+    # Field 2: search view mode (2 = Flight Search Results view, avoids Landing/Explore page)
+    root.extend(_encode_varint_field(2, 2))
 
     # Field 3 (slice 1): Outbound leg (origins -> destinations)
     outbound_slice = _encode_flight_slice_message(
@@ -477,13 +427,18 @@ def encode_tfs_protobuf(
     # Field 9: Cabin class / Seat
     root.extend(_encode_varint_field(9, seat_enum))
 
-    # Field 14: Carry-on bags filter (submessage field 1 = carry_on_bags)
+    # Field 14: Carry-on bags filter (submessage field 1 = bags count) or default varint 1
     if profile.carry_on_bags > 0:
         bags_msg = _encode_varint_field(1, min(2, int(profile.carry_on_bags)))
         root.extend(_encode_bytes_field(14, bags_msg))
+    else:
+        root.extend(_encode_varint_field(14, 1))
 
-    # Field 19: Standard Google Flights search view flag = 1
-    root.extend(_encode_varint_field(19, 1))
+    # Field 16: Google Flights search flags (all-results bitmask)
+    root.extend(_encode_bytes_field(16, b"\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01"))
+
+    # Field 19: Trip type (1 = round-trip, 2 = one-way)
+    root.extend(_encode_varint_field(19, trip_enum))
 
     encoded = base64.urlsafe_b64encode(bytes(root)).decode("ascii").rstrip("=")
     return encoded
@@ -621,10 +576,11 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
             return result
 
     slices: list[dict[str, Any]] = []
+    explicit_trip_type: Optional[str] = None
     top_fields = _parse_protobuf_fields(raw_bytes)
     for field_num, wire_type, val in top_fields:
-        if field_num == 2 and wire_type == 0:
-            result["trip_type"] = "one-way" if val == 2 else "round-trip"
+        if field_num == 19 and wire_type == 0:
+            explicit_trip_type = "one-way" if val == 2 else "round-trip"
         elif field_num == 3 and wire_type == 2 and isinstance(val, bytes):
             slice_info: dict[str, Any] = {
                 "date": None,
@@ -667,8 +623,9 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
             result["outbound_date"] = decoded_dates[0]
             if len(decoded_dates) > 1:
                 result["return_date"] = decoded_dates[1]
+                result["trip_type"] = explicit_trip_type or "round-trip"
             else:
-                result["trip_type"] = "one-way"
+                result["trip_type"] = explicit_trip_type or "one-way"
     else:
         first = slices[0]
         origins_list = first.get("origins") or []
@@ -682,9 +639,9 @@ def decode_tfs_parameter(tfs_b64: str) -> dict[str, Any]:
         result["airlines"] = first.get("airlines") or []
         if len(slices) >= 2 and slices[1].get("date"):
             result["return_date"] = slices[1].get("date")
-            result["trip_type"] = "round-trip"
+            result["trip_type"] = explicit_trip_type or "round-trip"
         else:
-            result["trip_type"] = "one-way"
+            result["trip_type"] = explicit_trip_type or "one-way"
 
     return result
 

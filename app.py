@@ -17,12 +17,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import hmac
-import sys
 from typing import Any, Optional
-
-# Hot-reload safety for Streamlit Cloud: purge cached in-memory src modules on rerun
-for _mod in [m for m in list(sys.modules.keys()) if m == "src" or m.startswith("src.")]:
-    sys.modules.pop(_mod, None)
 
 import pandas as pd
 import plotly.express as px
@@ -46,6 +41,7 @@ from src.config import (
 )
 from src.db import (
     bulk_create_date_slots,
+    clear_db_cache,
     create_destination,
     delete_date_slot,
     delete_destination,
@@ -353,11 +349,21 @@ def render_top_metrics_ribbon(summary: dict[str, Any]) -> None:
 # ==============================================================================
 
 
-def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
+def _rerun_fragment_safe() -> None:
+    """Rerun only the enclosing `@st.fragment` when active, falling back to full rerun."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
+@st.fragment
+def render_tab1_matrix_explorer() -> None:
     """Render Tab 1: Corridor Banner, 10-Date Comparison Table, Heatmap, and Plotly Charts."""
+    destinations = list_destinations(active_only=False)
     if not destinations:
         st.info(
-            "Aún no tienes destinos configurados. Ve a **Tab 2 — Destinos y Fechas** "
+            "Aún no tienes destinos configurados. Ve a **Destinos y Fechas** "
             "para crear tu primera ruta y sus fechas."
         )
         return
@@ -379,7 +385,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
         selected_option = st.selectbox(
             "Seleccionar Destino Monitoreado",
             options=dest_options,
-            format_func=lambda x: str(x[1]),
+            format_func=lambda x: str(x[1]) if isinstance(x, tuple) else str(x),
             key="tab1_dest_select",
         )
     selected_dest_id: Optional[int] = selected_option[0]
@@ -834,16 +840,54 @@ def _render_destination_management_drawer(
 # ==============================================================================
 
 
-def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) -> None:
+def _build_staged_slot(
+    out_date: datetime.date,
+    ret_date: Optional[datetime.date],
+    origin: str,
+    dest: str,
+    trip_type: str,
+    profile: FilterProfile,
+    curr: str,
+    gl: str,
+    hl: str,
+) -> dict[str, Any]:
+    """Build a staging-tray date slot dictionary with Google Flights URL and 330-day window status."""
+    out_str = out_date.strftime("%Y-%m-%d")
+    ret_str = ret_date.strftime("%Y-%m-%d") if ret_date else None
+    lbl = format_date_slot_label(out_str, ret_str)
+    win_status = get_flight_window_status(out_str, ret_str)
+    slot_url = build_google_flights_url(
+        origin=origin,
+        destination=dest,
+        outbound_date=out_str,
+        return_date=ret_str,
+        trip_type=trip_type,
+        filter_profile=profile,
+        curr=curr,
+        gl=gl,
+        hl=hl,
+    )
+    return {
+        "label": lbl,
+        "outbound_date": out_str,
+        "return_date": ret_str,
+        "google_flights_url": slot_url,
+        "window_info": win_status,
+    }
+
+
+@st.fragment
+def render_tab2_destination_and_generator() -> None:
     """
     Render Tab 2:
       1. Destination & Filter Profile (Create / Edit / Delete, duplicate-protected)
-      2. Travel Dates (Calendar Range, Auto-Generator, or Paste URLs)
+      2. Travel Dates (Unified destination context, saved dates, Calendar Range, Auto-Generator, Paste URLs)
     """
+    destinations = list_destinations(active_only=False)
     st.markdown("### 1. Destino y Filtros")
 
     mode_options: list[tuple[Optional[int], str]] = [
-        (None, "➕ Crear nuevo destino")
+        (None, "+ Nuevo destino")
     ]
     for d in destinations:
         mode_options.append(
@@ -858,7 +902,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         selected_mode = st.selectbox(
             "Destino",
             options=mode_options,
-            format_func=lambda x: str(x[1]),
+            format_func=lambda x: str(x[1]) if isinstance(x, tuple) else str(x),
             key="tab2_dest_mode",
         )
     editing_dest_id: Optional[int] = selected_mode[0]
@@ -872,7 +916,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
     with del_col:
         if existing_dest is not None:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            with st.popover("🗑 Eliminar", width="stretch"):
+            with st.popover("Eliminar destino", width="stretch"):
                 st.warning(
                     f"¿Eliminar **{existing_dest['name']}** y todas sus fechas e historial?"
                 )
@@ -885,6 +929,8 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     delete_destination(int(editing_dest_id))
                     if st.session_state.get("last_created_dest_id") == editing_dest_id:
                         st.session_state.pop("last_created_dest_id", None)
+                    st.session_state["staged_slots_list"] = []
+                    st.session_state.pop("staged_dest_id", None)
                     st.success(f"Destino **{existing_dest['name']}** eliminado.")
                     st.rerun()
 
@@ -1181,24 +1227,31 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         st.info("Crea al menos un destino arriba para agregar fechas.")
         return
 
-    default_dest_idx = 0
-    last_id = st.session_state.get("last_created_dest_id")
-    if last_id is not None:
-        for i, d in enumerate(destinations):
-            if int(d["id"]) == int(last_id):
-                default_dest_idx = i
-                break
+    if existing_dest is not None:
+        target_dest = existing_dest
+        st.caption(
+            f"**Destino activo:** {target_dest['name']} ({target_dest['origin']} ➔ {target_dest['destination']}) — "
+            f"{target_dest.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION} fechas"
+        )
+    else:
+        default_dest_idx = 0
+        last_id = st.session_state.get("last_created_dest_id")
+        if last_id is not None:
+            for i, d in enumerate(destinations):
+                if int(d["id"]) == int(last_id):
+                    default_dest_idx = i
+                    break
 
-    target_dest = st.selectbox(
-        "Destino",
-        options=destinations,
-        index=default_dest_idx,
-        format_func=lambda d: (
-            f"{d['name']} ({d['origin']} ➔ {d['destination']}) — "
-            f"{d.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION} fechas"
-        ),
-        key="step2_target_dest",
-    )
+        target_dest = st.selectbox(
+            "Destino",
+            options=destinations,
+            index=default_dest_idx,
+            format_func=lambda d: (
+                f"{d['name']} ({d['origin']} ➔ {d['destination']}) — "
+                f"{d.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION} fechas"
+            ),
+            key="step2_target_dest",
+        )
 
     dest_id = int(target_dest["id"])
     dest_origin = str(target_dest["origin"])
@@ -1208,6 +1261,35 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
     dest_gl = str(target_dest.get("gl", DEFAULT_GL))
     dest_hl = str(target_dest.get("hl", DEFAULT_HL))
     dest_profile = FilterProfile.from_dict(target_dest.get("filter_config"))
+
+    if st.session_state.get("staged_dest_id") != dest_id:
+        st.session_state["staged_slots_list"] = []
+        st.session_state["staged_dest_id"] = dest_id
+
+    saved_slots = list_date_slots(destination_id=dest_id, active_only=False)
+    saved_pairs: set[tuple[str, Optional[str]]] = {
+        (
+            str(s["outbound_date"]).strip(),
+            str(s["return_date"]).strip() if s.get("return_date") else None,
+        )
+        for s in saved_slots
+    }
+
+    if saved_slots:
+        with st.expander(f"Fechas guardadas ({len(saved_slots)}/{MAX_SLOTS_PER_DESTINATION})", expanded=False):
+            for sv in saved_slots:
+                svc1, svc2, svc3 = st.columns([2.6, 1.8, 0.8])
+                with svc1:
+                    st.markdown(f"`{sv.get('label') or sv.get('outbound_date')}`")
+                with svc2:
+                    sv_win = sv.get("window_info") or get_flight_window_status(sv.get("outbound_date"), sv.get("return_date"))
+                    sv_price = sv.get("latest_cheapest_price")
+                    price_txt = f" • ${sv_price:,.0f} {dest_curr}" if sv_price is not None else ""
+                    st.caption(f"{sv_win['badge']}{price_txt}")
+                with svc3:
+                    if st.button("Borrar", key=f"tab2_del_saved_{sv['id']}", width="stretch"):
+                        delete_date_slot(int(sv["id"]))
+                        st.rerun()
 
     today = datetime.date.today()
     max_searchable_date = today + datetime.timedelta(days=GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS)
@@ -1292,59 +1374,112 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
 
                 can_add = len(staged_slots) < MAX_SLOTS_PER_DESTINATION
                 add_btn_txt = f"Agregar ({len(staged_slots)}/{MAX_SLOTS_PER_DESTINATION})" if can_add else "Lista llena (10)"
+                staged_pairs = {(s["outbound_date"], s.get("return_date")) for s in staged_slots}
+                blocked_pairs = staged_pairs if replace_mode else (staged_pairs | saved_pairs)
 
-                b_add, b_shift7 = st.columns([1.2, 1])
+                b_add, b_shift7, b_4wks = st.columns([1.15, 0.9, 1.05])
                 with b_add:
                     if st.button(add_btn_txt, disabled=not can_add, key="btn_add_staged", type="primary", width="stretch"):
-                        if any(s["outbound_date"] == out_str and s.get("return_date") == ret_str for s in staged_slots):
+                        if (out_str, ret_str) in staged_pairs:
                             st.warning("Esta fecha ya está en la lista.")
+                        elif not replace_mode and (out_str, ret_str) in saved_pairs:
+                            st.warning("Esta fecha ya está guardada en el destino.")
                         else:
-                            slot_url = build_google_flights_url(
-                                origin=dest_origin,
-                                destination=dest_code,
-                                outbound_date=out_str,
-                                return_date=ret_str,
-                                trip_type=dest_trip,
-                                filter_profile=dest_profile,
-                                curr=dest_curr,
-                                gl=dest_gl,
-                                hl=dest_hl,
+                            staged_slots.append(
+                                _build_staged_slot(
+                                    range_start,
+                                    range_end,
+                                    dest_origin,
+                                    dest_code,
+                                    dest_trip,
+                                    dest_profile,
+                                    dest_curr,
+                                    dest_gl,
+                                    dest_hl,
+                                )
                             )
-                            staged_slots.append({
-                                "label": lbl,
-                                "outbound_date": out_str,
-                                "return_date": ret_str,
-                                "google_flights_url": slot_url,
-                                "window_info": win_status,
-                            })
-                            st.rerun()
+                            _rerun_fragment_safe()
                 with b_shift7:
                     if st.button("+7 días", disabled=not can_add, key="btn_shift_7", width="stretch"):
-                        shift_out = range_start + datetime.timedelta(days=7)
-                        shift_ret = (range_end + datetime.timedelta(days=7)) if range_end else None
-                        s_out_str = shift_out.strftime("%Y-%m-%d")
-                        s_ret_str = shift_ret.strftime("%Y-%m-%d") if shift_ret else None
-                        s_lbl = format_date_slot_label(s_out_str, s_ret_str)
-                        s_win = get_flight_window_status(s_out_str, s_ret_str)
-                        s_url = build_google_flights_url(
-                            origin=dest_origin,
-                            destination=dest_code,
-                            outbound_date=s_out_str,
-                            return_date=s_ret_str,
-                            trip_type=dest_trip,
-                            filter_profile=dest_profile,
-                            curr=dest_curr,
-                            gl=dest_gl,
-                            hl=dest_hl,
+                        if staged_slots:
+                            last_slot = staged_slots[-1]
+                            base_out = datetime.date.fromisoformat(str(last_slot["outbound_date"]))
+                            base_ret = (
+                                datetime.date.fromisoformat(str(last_slot["return_date"]))
+                                if last_slot.get("return_date")
+                                else None
+                            )
+                        else:
+                            base_out = range_start
+                            base_ret = range_end
+
+                        shift_out = base_out + datetime.timedelta(days=7)
+                        shift_ret = (base_ret + datetime.timedelta(days=7)) if base_ret else None
+                        pair_key = (
+                            shift_out.strftime("%Y-%m-%d"),
+                            shift_ret.strftime("%Y-%m-%d") if shift_ret else None,
                         )
-                        staged_slots.append({
-                            "label": s_lbl,
-                            "outbound_date": s_out_str,
-                            "return_date": s_ret_str,
-                            "google_flights_url": s_url,
-                            "window_info": s_win,
-                        })
-                        st.rerun()
+                        if pair_key in blocked_pairs:
+                            st.warning("La fecha +7 días ya está agregada o guardada.")
+                        else:
+                            staged_slots.append(
+                                _build_staged_slot(
+                                    shift_out,
+                                    shift_ret,
+                                    dest_origin,
+                                    dest_code,
+                                    dest_trip,
+                                    dest_profile,
+                                    dest_curr,
+                                    dest_gl,
+                                    dest_hl,
+                                )
+                            )
+                            _rerun_fragment_safe()
+                with b_4wks:
+                    if st.button("+4 semanas", disabled=not can_add, key="btn_add_4_weeks", width="stretch"):
+                        if staged_slots:
+                            last_slot = staged_slots[-1]
+                            cursor_out = datetime.date.fromisoformat(str(last_slot["outbound_date"])) + datetime.timedelta(days=7)
+                            cursor_ret = (
+                                (datetime.date.fromisoformat(str(last_slot["return_date"])) + datetime.timedelta(days=7))
+                                if last_slot.get("return_date")
+                                else None
+                            )
+                        else:
+                            cursor_out = range_start
+                            cursor_ret = range_end
+
+                        added_count = 0
+                        steps = 0
+                        while added_count < 4 and len(staged_slots) < MAX_SLOTS_PER_DESTINATION and steps < 12:
+                            pair_key = (
+                                cursor_out.strftime("%Y-%m-%d"),
+                                cursor_ret.strftime("%Y-%m-%d") if cursor_ret else None,
+                            )
+                            if pair_key not in blocked_pairs:
+                                staged_slots.append(
+                                    _build_staged_slot(
+                                        cursor_out,
+                                        cursor_ret,
+                                        dest_origin,
+                                        dest_code,
+                                        dest_trip,
+                                        dest_profile,
+                                        dest_curr,
+                                        dest_gl,
+                                        dest_hl,
+                                    )
+                                )
+                                blocked_pairs.add(pair_key)
+                                added_count += 1
+                            cursor_out = cursor_out + datetime.timedelta(days=7)
+                            cursor_ret = (cursor_ret + datetime.timedelta(days=7)) if cursor_ret else None
+                            steps += 1
+                        if added_count > 0:
+                            _rerun_fragment_safe()
+                        else:
+                            st.warning("Esas semanas ya están agregadas o guardadas.")
 
         # Visual Tray of Staged Slots
         st.markdown("---")
@@ -1354,7 +1489,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         with tray_h2:
             if staged_slots and st.button("Limpiar", key="btn_clear_staged", width="stretch"):
                 st.session_state["staged_slots_list"] = []
-                st.rerun()
+                _rerun_fragment_safe()
 
         if not staged_slots:
             st.info("Lista vacía. Selecciona fechas arriba y presiona **Agregar**.")
@@ -1374,7 +1509,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 with sc3:
                     if st.button("✕", key=f"del_staged_{s_idx}", help="Quitar"):
                         staged_slots.pop(s_idx)
-                        st.rerun()
+                        _rerun_fragment_safe()
 
             st.markdown("")
             if st.button(
@@ -1564,16 +1699,16 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
 # ==============================================================================
 
 
-def render_tab3_scanner_and_logs(
-    destinations: list[dict[str, Any]],
-    summary: dict[str, Any],
-) -> None:
+@st.fragment
+def render_tab3_scanner_and_logs() -> None:
     """
     Render Tab 3:
       - Immediate Live Scanner (by Date Slot, Destination, or Due Batch)
       - Consolidated Digest Telegram Tester (faithful to 330-day window)
       - Recent `alert_logs` table & `extraction_source` distribution metrics
     """
+    destinations = list_destinations(active_only=False)
+    summary = get_dashboard_summary()
     col_scan, col_tg = st.columns([1.45, 1.15])
 
     with col_scan:
@@ -1650,6 +1785,7 @@ def render_tab3_scanner_and_logs(
                     )
                     run_summary = future.result()
 
+            clear_db_cache()
             progress_bar.progress(1.0, text="Escaneo finalizado.")
             if run_summary["total_due"] == 0:
                 status_box.info(
@@ -1686,7 +1822,7 @@ def render_tab3_scanner_and_logs(
         tg_sel = st.selectbox(
             "Destino para la Tarjeta de Prueba",
             options=tg_dest_options,
-            format_func=lambda x: str(x[1]),
+            format_func=lambda x: str(x[1]) if isinstance(x, tuple) else str(x),
             key="tab3_tg_dest",
         )
         if st.button("Enviar Tarjeta Digest de Prueba a Telegram", width="stretch"):
@@ -1784,18 +1920,21 @@ def render_tab3_scanner_and_logs(
             targets_to_test = list(pool)
             if custom_proxy_test.strip() and custom_proxy_test.strip() not in targets_to_test:
                 targets_to_test.append(custom_proxy_test.strip())
+            if None not in targets_to_test:
+                targets_to_test.append(None)
 
             results_list = []
-            for target in targets_to_test:
-                with st.spinner(f"Probando {target or 'Conexión Directa'}..."):
-                    res = test_proxy_connection(target)
-                    status_desc = "Acceso Correcto (HTTP 200)" if res["success"] else f"Error: {res['error'] or 'Bloqueado'}"
-                    results_list.append({
-                        "Proxy / Red": res["proxy_url"],
-                        "IP Pública Detectada": res["ip"],
-                        "Latencia": f"{res['latency_ms']} ms",
-                        "Acceso a Google Flights": status_desc,
-                    })
+            with st.spinner(f"Probando {len(targets_to_test)} conexiones en paralelo..."):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(targets_to_test)))) as ex:
+                    test_results = list(ex.map(test_proxy_connection, targets_to_test))
+            for res in test_results:
+                status_desc = "Acceso Correcto (HTTP 200)" if res["success"] else f"Error: {res['error'] or 'Bloqueado'}"
+                results_list.append({
+                    "Proxy / Red": res["proxy_url"],
+                    "IP Pública Detectada": res["ip"],
+                    "Latencia": f"{res['latency_ms']} ms",
+                    "Acceso a Google Flights": status_desc,
+                })
             st.dataframe(pd.DataFrame(results_list), width="stretch", hide_index=True)
 
 
@@ -1825,6 +1964,7 @@ def main() -> None:
         )
         st.markdown("---")
         if st.button("Refrescar Datos", width="stretch"):
+            clear_db_cache()
             st.rerun()
         if st.button("Cerrar Sesión", width="stretch"):
             st.session_state["authenticated"] = False
@@ -1834,7 +1974,6 @@ def main() -> None:
         return
 
     summary = get_dashboard_summary()
-    destinations = list_destinations(active_only=False)
 
     st.markdown("## FlightPulse Matrix v4.0 — Control Center")
     render_top_metrics_ribbon(summary)
@@ -1842,20 +1981,20 @@ def main() -> None:
 
     tab1, tab2, tab3 = st.tabs(
         [
-            "Tab 1 — Explorador del Corredor y Matriz de Precios",
-            "Tab 2 — Destinos y Fechas",
-            "Tab 3 — Escáner en Vivo, Métricas y Probador de Telegram",
+            "Matriz de Precios",
+            "Destinos y Fechas",
+            "Escáner y Alertas",
         ]
     )
 
     with tab1:
-        render_tab1_matrix_explorer(destinations)
+        render_tab1_matrix_explorer()
 
     with tab2:
-        render_tab2_destination_and_generator(destinations)
+        render_tab2_destination_and_generator()
 
     with tab3:
-        render_tab3_scanner_and_logs(destinations, summary)
+        render_tab3_scanner_and_logs()
 
 
 if __name__ == "__main__":

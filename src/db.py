@@ -6,8 +6,10 @@ Implements the 4-table hierarchical schema:
 
 from __future__ import annotations
 
+import copy
 import logging
 import sys
+import threading
 import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -197,21 +199,151 @@ def _to_float(val: Any) -> Optional[float]:
         return None
 
 
-def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Connection[Any]:
-    """
-    Create a psycopg v3 connection to Neon Serverless PostgreSQL with retry
-    logic to handle serverless compute cold-starts gracefully.
-    """
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is not configured. Set DATABASE_URL in your .env file or Streamlit secrets."
-        )
+_CACHE_TTL_SECONDS: float = 30.0
+_IDLE_RECONNECT_SECONDS: float = 45.0
+_READ_CACHE: dict[tuple[Any, ...], tuple[float, Any]] = {}
+_CACHE_LOCK = threading.RLock()
+_INIT_LOCK = threading.Lock()
+_db_initialized: bool = False
 
-    if psycopg is None or dict_row is None:
-        raise RuntimeError(
-            "psycopg is not installed. Install psycopg[binary] to connect to Neon PostgreSQL."
-        )
+_THREAD_LOCAL = threading.local()
+_STATS_LOCK = threading.Lock()
+_DB_STATS: dict[str, int] = {
+    "total_connects": 0,
+    "total_queries": 0,
+}
 
+
+def connection_stats() -> dict[str, int]:
+    """Return cumulative DB TCP/TLS connection and SQL query execution counters."""
+    with _STATS_LOCK:
+        return dict(_DB_STATS)
+
+
+def reset_connection_stats() -> None:
+    """Reset DB connection and SQL query counters (used by performance benchmarks)."""
+    with _STATS_LOCK:
+        _DB_STATS["total_connects"] = 0
+        _DB_STATS["total_queries"] = 0
+
+
+def clear_db_cache() -> None:
+    """Invalidate all cached read queries after any write mutation."""
+    with _CACHE_LOCK:
+        _READ_CACHE.clear()
+
+
+def _cache_get(key: tuple[Any, ...]) -> tuple[bool, Any]:
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = _READ_CACHE.get(key)
+        if entry is None:
+            return False, None
+        ts, payload = entry
+        if (now - ts) >= _CACHE_TTL_SECONDS:
+            _READ_CACHE.pop(key, None)
+            return False, None
+        return True, copy.deepcopy(payload)
+
+
+def _cache_set(key: tuple[Any, ...], payload: Any) -> None:
+    with _CACHE_LOCK:
+        _READ_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+
+
+class _TrackedCursor:
+    """Lightweight cursor proxy that increments `total_queries` on every SQL execution."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def execute(self, query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        with _STATS_LOCK:
+            _DB_STATS["total_queries"] += 1
+        if params is not None:
+            return self._inner.execute(query, params, *args, **kwargs)
+        return self._inner.execute(query, *args, **kwargs)
+
+    def executemany(self, query: Any, params_seq: Any, *args: Any, **kwargs: Any) -> Any:
+        with _STATS_LOCK:
+            _DB_STATS["total_queries"] += 1
+        return self._inner.executemany(query, params_seq, *args, **kwargs)
+
+    def __enter__(self) -> "_TrackedCursor":
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+        return self._inner.__exit__(exc_type, exc_val, exc_tb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _ReusableConnectionContext:
+    """
+    Context wrapper around a persistent thread-local `psycopg` connection.
+    Commits or rolls back on context exit while keeping the TCP+TLS socket open for reuse.
+    """
+
+    def __init__(self, raw_conn: Any) -> None:
+        self._raw = raw_conn
+
+    def cursor(self, *args: Any, **kwargs: Any) -> _TrackedCursor:
+        return _TrackedCursor(self._raw.cursor(*args, **kwargs))
+
+    def commit(self) -> None:
+        self._raw.commit()
+
+    def rollback(self) -> None:
+        self._raw.rollback()
+
+    def close(self) -> None:
+        # Keep the persistent socket alive across calls; commit any open read txn safely.
+        try:
+            if not self._raw.closed and self._raw.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:  # type: ignore[union-attr]
+                self._raw.commit()
+        except Exception:
+            _discard_thread_connection()
+
+    def __enter__(self) -> "_ReusableConnectionContext":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        try:
+            if exc_type is not None:
+                try:
+                    self._raw.rollback()
+                except Exception:
+                    _discard_thread_connection()
+                if getattr(self._raw, "broken", False) or getattr(self._raw, "closed", False):
+                    _discard_thread_connection()
+            else:
+                try:
+                    if self._raw.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:  # type: ignore[union-attr]
+                        self._raw.commit()
+                except Exception:
+                    _discard_thread_connection()
+                    raise
+        finally:
+            _THREAD_LOCAL.last_used_at = time.monotonic()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+def _discard_thread_connection() -> None:
+    raw_conn = getattr(_THREAD_LOCAL, "conn", None)
+    _THREAD_LOCAL.conn = None
+    _THREAD_LOCAL.last_used_at = 0.0
+    if raw_conn is not None:
+        try:
+            raw_conn.close()
+        except Exception:
+            pass
+
+
+def _open_raw_connection(retries: int = 3, delay_seconds: float = 1.5) -> Any:
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
@@ -221,6 +353,8 @@ def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Conn
                 connect_timeout=15,
                 autocommit=False,
             )
+            with _STATS_LOCK:
+                _DB_STATS["total_connects"] += 1
             return conn
         except Exception as exc:
             last_error = exc
@@ -236,17 +370,65 @@ def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> psycopg.Conn
     raise RuntimeError(f"Could not connect to Neon PostgreSQL after {retries} attempts: {last_error}")
 
 
-def init_db() -> None:
+def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> _ReusableConnectionContext:
+    """
+    Obtain a persistent, thread-local `psycopg` v3 connection to Neon Serverless PostgreSQL.
+    Reuses the open TCP+TLS socket across calls and transparently reconnects if closed or idle.
+    """
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured. Set DATABASE_URL in your .env file or Streamlit secrets."
+        )
+
+    if psycopg is None or dict_row is None:
+        raise RuntimeError(
+            "psycopg is not installed. Install psycopg[binary] to connect to Neon PostgreSQL."
+        )
+
+    raw_conn = getattr(_THREAD_LOCAL, "conn", None)
+    last_used = float(getattr(_THREAD_LOCAL, "last_used_at", 0.0) or 0.0)
+
+    if raw_conn is not None:
+        is_bad = bool(getattr(raw_conn, "closed", False) or getattr(raw_conn, "broken", False))
+        if not is_bad:
+            try:
+                if raw_conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:  # type: ignore[union-attr]
+                    raw_conn.rollback()
+                if (time.monotonic() - last_used) > _IDLE_RECONNECT_SECONDS:
+                    raw_conn.execute("SELECT 1;")
+                    raw_conn.commit()
+            except Exception:
+                is_bad = True
+        if is_bad:
+            _discard_thread_connection()
+            raw_conn = None
+
+    if raw_conn is None:
+        raw_conn = _open_raw_connection(retries=retries, delay_seconds=delay_seconds)
+        _THREAD_LOCAL.conn = raw_conn
+        _THREAD_LOCAL.last_used_at = time.monotonic()
+
+    return _ReusableConnectionContext(raw_conn)
+
+
+def init_db(force: bool = False) -> None:
     """
     Auto-initialize the 4 tables, execute idempotent N:M multi-airport migrations,
-    and verify indexes in Neon PostgreSQL.
+    and verify indexes in Neon PostgreSQL once per process.
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(cast(LiteralString, SCHEMA_SQL))
-            cur.execute(cast(LiteralString, MIGRATION_SQL))
-        conn.commit()
-    logger.info("Database schema initialized and migrated for N:M Multi-Airport support.")
+    global _db_initialized
+    if _db_initialized and not force:
+        return
+    with _INIT_LOCK:
+        if _db_initialized and not force:
+            return
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(cast(LiteralString, SCHEMA_SQL))
+                cur.execute(cast(LiteralString, MIGRATION_SQL))
+            conn.commit()
+        _db_initialized = True
+        logger.info("Database schema initialized and migrated for N:M Multi-Airport support.")
 
 
 # ==============================================================================
@@ -256,45 +438,51 @@ def init_db() -> None:
 
 def list_destinations(active_only: bool = False) -> list[dict[str, Any]]:
     """
-    Fetch all destinations with aggregated slot metrics (active slot count,
-    lowest cheapest/best prices across slots, slots below target price).
+    Fetch all destinations with aggregated slot metrics (cached for 30s, invalidated on writes).
     """
-    where_clause = "WHERE d.is_active = TRUE" if active_only else ""
-    query = f"""
-        SELECT
-            d.*,
-            COUNT(ds.id) AS total_slots,
-            COUNT(ds.id) FILTER (WHERE ds.is_active = TRUE) AS active_slots,
-            MIN(ds.latest_cheapest_price) FILTER (WHERE ds.is_active = TRUE) AS min_cheapest_price,
-            MIN(ds.latest_best_price) FILTER (WHERE ds.is_active = TRUE) AS min_best_price,
-            MIN(ds.all_time_low_price) FILTER (WHERE ds.is_active = TRUE) AS min_all_time_low,
-            COUNT(ds.id) FILTER (
-                WHERE ds.is_active = TRUE
-                  AND ds.latest_cheapest_price IS NOT NULL
-                  AND ds.latest_cheapest_price <= d.target_price
-            ) AS slots_below_target,
-            MAX(ds.last_checked_at) AS last_checked_at
-        FROM destinations d
-        LEFT JOIN date_slots ds ON ds.destination_id = d.id
-        {where_clause}
-        GROUP BY d.id
-        ORDER BY d.is_active DESC, d.id ASC;
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(cast(LiteralString, query))
-            rows = cur.fetchall()
+    cache_key = ("list_destinations",)
+    hit, cached = _cache_get(cache_key)
+    if hit:
+        all_items: list[dict[str, Any]] = cached
+    else:
+        query = """
+            SELECT
+                d.*,
+                COUNT(ds.id) AS total_slots,
+                COUNT(ds.id) FILTER (WHERE ds.is_active = TRUE) AS active_slots,
+                MIN(ds.latest_cheapest_price) FILTER (WHERE ds.is_active = TRUE) AS min_cheapest_price,
+                MIN(ds.latest_best_price) FILTER (WHERE ds.is_active = TRUE) AS min_best_price,
+                MIN(ds.all_time_low_price) FILTER (WHERE ds.is_active = TRUE) AS min_all_time_low,
+                COUNT(ds.id) FILTER (
+                    WHERE ds.is_active = TRUE
+                      AND ds.latest_cheapest_price IS NOT NULL
+                      AND ds.latest_cheapest_price <= d.target_price
+                ) AS slots_below_target,
+                MAX(ds.last_checked_at) AS last_checked_at
+            FROM destinations d
+            LEFT JOIN date_slots ds ON ds.destination_id = d.id
+            GROUP BY d.id
+            ORDER BY d.is_active DESC, d.id ASC;
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(cast(LiteralString, query))
+                rows = cur.fetchall()
 
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        item["target_price"] = _to_float(item.get("target_price")) or 0.0
-        item["min_cheapest_price"] = _to_float(item.get("min_cheapest_price"))
-        item["min_best_price"] = _to_float(item.get("min_best_price"))
-        item["min_all_time_low"] = _to_float(item.get("min_all_time_low"))
-        item["filter_config"] = item.get("filter_config") or {}
-        results.append(item)
-    return results
+        all_items = []
+        for row in rows:
+            item = dict(row)
+            item["target_price"] = _to_float(item.get("target_price")) or 0.0
+            item["min_cheapest_price"] = _to_float(item.get("min_cheapest_price"))
+            item["min_best_price"] = _to_float(item.get("min_best_price"))
+            item["min_all_time_low"] = _to_float(item.get("min_all_time_low"))
+            item["filter_config"] = item.get("filter_config") or {}
+            all_items.append(item)
+        _cache_set(cache_key, all_items)
+
+    if active_only:
+        return [d for d in all_items if d.get("is_active")]
+    return all_items
 
 
 def get_destination(destination_id: int) -> Optional[dict[str, Any]]:
@@ -430,6 +618,7 @@ def create_destination(
                 raise RuntimeError("Failed to create destination: no row returned.")
             new_id = int(row["id"])
         conn.commit()
+    clear_db_cache()
     logger.info("Created destination id=%d (%s: %s -> %s)", new_id, clean_name, norm_origin, norm_dest)
     return new_id
 
@@ -516,12 +705,13 @@ def update_destination(
                 ),
             )
 
-            # Synchronize all existing date_slots URLs with the updated N:M corridor and filters
+            # Synchronize all existing date_slots URLs in a single batched executemany
             cur.execute(
                 "SELECT id, outbound_date, return_date FROM date_slots WHERE destination_id = %s;",
                 (destination_id,),
             )
             slot_rows = cur.fetchall()
+            url_updates: list[tuple[str, int]] = []
             for s_row in slot_rows:
                 rebuilt_url = build_google_flights_url(
                     origin=origin_airports,
@@ -534,11 +724,14 @@ def update_destination(
                     gl=clean_gl,
                     hl=clean_hl,
                 )
-                cur.execute(
+                url_updates.append((rebuilt_url, int(s_row["id"])))
+            if url_updates:
+                cur.executemany(
                     "UPDATE date_slots SET google_flights_url = %s WHERE id = %s;",
-                    (rebuilt_url, int(s_row["id"])),
+                    url_updates,
                 )
         conn.commit()
+    clear_db_cache()
 
 
 def set_destination_active(destination_id: int, is_active: bool) -> None:
@@ -562,6 +755,7 @@ def set_destination_active(destination_id: int, is_active: bool) -> None:
                 (bool(is_active), destination_id),
             )
         conn.commit()
+    clear_db_cache()
 
 
 def delete_destination(destination_id: int) -> None:
@@ -572,6 +766,7 @@ def delete_destination(destination_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM destinations WHERE id = %s;", (destination_id,))
         conn.commit()
+    clear_db_cache()
     logger.info("Deleted destination id=%d", destination_id)
 
 
@@ -586,54 +781,57 @@ def list_date_slots(
 ) -> list[dict[str, Any]]:
     """
     List date_slots ordered by outbound_date ASC, joined with parent destination info.
+    Caches the full slot list for 30s and filters by destination/active status in memory
+    so switching destinations in the dashboard performs 0 SQL queries.
     """
-    conditions: list[str] = []
-    params: list[Any] = []
+    cache_key = ("list_date_slots_all",)
+    hit, cached = _cache_get(cache_key)
+    if hit:
+        all_slots: list[dict[str, Any]] = cached
+    else:
+        query = """
+            SELECT
+                ds.*,
+                d.name AS destination_name,
+                d.origin AS origin,
+                d.destination AS destination_code,
+                d.trip_type AS trip_type,
+                d.currency AS currency,
+                d.gl AS gl,
+                d.hl AS hl,
+                d.target_price AS target_price,
+                d.check_interval_minutes AS check_interval_minutes,
+                d.cooldown_hours AS cooldown_hours,
+                d.filter_config AS filter_config,
+                d.is_active AS destination_is_active
+            FROM date_slots ds
+            JOIN destinations d ON d.id = ds.destination_id
+            ORDER BY ds.destination_id ASC, ds.outbound_date ASC, ds.id ASC;
+        """
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(cast(LiteralString, query))
+                rows = cur.fetchall()
 
+        all_slots = []
+        for row in rows:
+            item = dict(row)
+            item["latest_cheapest_price"] = _to_float(item.get("latest_cheapest_price"))
+            item["latest_best_price"] = _to_float(item.get("latest_best_price"))
+            item["all_time_low_price"] = _to_float(item.get("all_time_low_price"))
+            item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
+            item["target_price"] = _to_float(item.get("target_price")) or 0.0
+            item["filter_config"] = item.get("filter_config") or {}
+            item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
+            all_slots.append(item)
+        _cache_set(cache_key, all_slots)
+
+    filtered = all_slots
     if destination_id is not None:
-        conditions.append("ds.destination_id = %s")
-        params.append(destination_id)
+        filtered = [s for s in filtered if int(s["destination_id"]) == int(destination_id)]
     if active_only:
-        conditions.append("ds.is_active = TRUE")
-
-    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    query = f"""
-        SELECT
-            ds.*,
-            d.name AS destination_name,
-            d.origin AS origin,
-            d.destination AS destination_code,
-            d.trip_type AS trip_type,
-            d.currency AS currency,
-            d.gl AS gl,
-            d.hl AS hl,
-            d.target_price AS target_price,
-            d.check_interval_minutes AS check_interval_minutes,
-            d.cooldown_hours AS cooldown_hours,
-            d.filter_config AS filter_config,
-            d.is_active AS destination_is_active
-        FROM date_slots ds
-        JOIN destinations d ON d.id = ds.destination_id
-        {where_sql}
-        ORDER BY ds.destination_id ASC, ds.outbound_date ASC, ds.id ASC;
-    """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(cast(LiteralString, query), tuple(params))
-            rows = cur.fetchall()
-
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        item["latest_cheapest_price"] = _to_float(item.get("latest_cheapest_price"))
-        item["latest_best_price"] = _to_float(item.get("latest_best_price"))
-        item["all_time_low_price"] = _to_float(item.get("all_time_low_price"))
-        item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
-        item["target_price"] = _to_float(item.get("target_price")) or 0.0
-        item["filter_config"] = item.get("filter_config") or {}
-        item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
-        results.append(item)
-    return results
+        filtered = [s for s in filtered if bool(s.get("is_active"))]
+    return filtered
 
 
 def get_date_slot(slot_id: int) -> Optional[dict[str, Any]]:
@@ -731,6 +929,7 @@ def create_date_slot(
                 raise RuntimeError("Failed to insert date_slot: no row returned.")
             slot_id = int(slot_row["id"])
         conn.commit()
+    clear_db_cache()
     return slot_id
 
 
@@ -740,14 +939,55 @@ def bulk_create_date_slots(
     replace_existing: bool = False,
 ) -> list[int]:
     """
-    Batch-insert up to 10 date_slots for a destination in a single transaction.
+    Batch-insert up to 10 date_slots for a destination in a single transaction
+    using one multi-row INSERT statement, skipping duplicate `(outbound_date, return_date)` pairs.
     If `replace_existing=True`, removes existing slots for this destination before inserting.
     """
+    if not slots and not replace_existing:
+        return []
+
     created_ids: list[int] = []
     with get_connection() as conn:
         with conn.cursor() as cur:
             if replace_existing:
                 cur.execute("DELETE FROM date_slots WHERE destination_id = %s;", (destination_id,))
+                existing_pairs: set[tuple[str, Optional[str]]] = set()
+            else:
+                cur.execute(
+                    "SELECT outbound_date, return_date FROM date_slots WHERE destination_id = %s;",
+                    (destination_id,),
+                )
+                existing_pairs = {
+                    (
+                        str(r["outbound_date"]).strip(),
+                        str(r["return_date"]).strip() if r.get("return_date") else None,
+                    )
+                    for r in cur.fetchall()
+                }
+
+            deduped_slots: list[dict[str, Any]] = []
+            seen_pairs = set(existing_pairs)
+            for slot in slots:
+                out_d = str(slot["outbound_date"]).strip()
+                ret_d = str(slot["return_date"]).strip() if slot.get("return_date") else None
+                pair_key = (out_d, ret_d)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                deduped_slots.append(
+                    {
+                        "label": slot.get("label"),
+                        "outbound_date": out_d,
+                        "return_date": ret_d,
+                        "google_flights_url": str(slot["google_flights_url"]).strip(),
+                        "is_active": bool(slot.get("is_active", True)),
+                    }
+                )
+
+            if not deduped_slots:
+                conn.commit()
+                clear_db_cache()
+                return []
 
             cur.execute(
                 "SELECT COUNT(*) AS cnt FROM date_slots WHERE destination_id = %s AND is_active = TRUE;",
@@ -762,35 +1002,39 @@ def bulk_create_date_slots(
             total_active = int(total_row["cnt"]) if total_row else 0
             available_total = max(0, MAX_TOTAL_SLOTS - total_active)
 
-            max_can_add = min(available_for_dest, available_total, len(slots))
-            if max_can_add <= 0 and slots:
+            max_can_add = min(available_for_dest, available_total, len(deduped_slots))
+            if max_can_add <= 0:
                 raise ValueError(
                     f"Cannot add date slots: destination has {existing_active}/{MAX_SLOTS_PER_DESTINATION} active slots "
                     f"(total active across matrix: {total_active}/{MAX_TOTAL_SLOTS})."
                 )
 
-            for idx, slot in enumerate(slots[:max_can_add]):
-                outbound_date = str(slot["outbound_date"]).strip()
-                return_date = str(slot["return_date"]).strip() if slot.get("return_date") else None
-                url = str(slot["google_flights_url"]).strip()
-                label = slot.get("label")
-                is_active = bool(slot.get("is_active", True))
-
-                cur.execute(
-                    """
-                    INSERT INTO date_slots (
-                        destination_id, label, outbound_date, return_date, google_flights_url, is_active
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id;
-                    """,
-                    (destination_id, label, outbound_date, return_date, url, is_active),
+            to_insert = deduped_slots[:max_can_add]
+            placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * len(to_insert))
+            flat_params: list[Any] = []
+            for slot in to_insert:
+                flat_params.extend(
+                    [
+                        destination_id,
+                        slot["label"],
+                        slot["outbound_date"],
+                        slot["return_date"],
+                        slot["google_flights_url"],
+                        slot["is_active"],
+                    ]
                 )
-                ins_row = cur.fetchone()
-                if ins_row:
-                    created_ids.append(int(ins_row["id"]))
+            insert_sql = f"""
+                INSERT INTO date_slots (
+                    destination_id, label, outbound_date, return_date, google_flights_url, is_active
+                )
+                VALUES {placeholders}
+                RETURNING id;
+            """
+            cur.execute(cast(LiteralString, insert_sql), tuple(flat_params))
+            created_ids = [int(r["id"]) for r in cur.fetchall()]
         conn.commit()
 
+    clear_db_cache()
     logger.info(
         "Bulk-created %d date slots for destination_id=%d (replace_existing=%s)",
         len(created_ids),
@@ -826,6 +1070,7 @@ def set_date_slot_active(slot_id: int, is_active: bool) -> None:
                 (bool(is_active), slot_id),
             )
         conn.commit()
+    clear_db_cache()
 
 
 def delete_date_slot(slot_id: int) -> None:
@@ -836,6 +1081,7 @@ def delete_date_slot(slot_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM date_slots WHERE id = %s;", (slot_id,))
         conn.commit()
+    clear_db_cache()
 
 
 def fetch_due_date_slots(
@@ -1075,6 +1321,7 @@ def record_price_snapshot(
                 ),
             )
         conn.commit()
+    clear_db_cache()
 
     return {
         "snapshot_id": snapshot_id,
@@ -1100,13 +1347,20 @@ def touch_slot_checked(date_slot_id: int) -> None:
                 (date_slot_id,),
             )
         conn.commit()
+    clear_db_cache()
 
 
 def get_snapshots_for_destination(destination_id: int, days: int = 30) -> list[dict[str, Any]]:
     """
     Fetch historical price snapshots for all date slots belonging to a destination
     for the Plotly multi-date evolution chart and dual-line Cheapest vs. Best chart.
+    Cached for 30s per `(destination_id, days)`.
     """
+    cache_key = ("get_snapshots", int(destination_id), int(days))
+    hit, cached = _cache_get(cache_key)
+    if hit:
+        return cached
+
     query = """
         SELECT
             ps.*,
@@ -1130,6 +1384,7 @@ def get_snapshots_for_destination(destination_id: int, days: int = 30) -> list[d
         item["cheapest_tab_price"] = _to_float(item.get("cheapest_tab_price"))
         item["best_tab_price"] = _to_float(item.get("best_tab_price"))
         results.append(item)
+    _cache_set(cache_key, results)
     return results
 
 
@@ -1201,13 +1456,19 @@ def record_alert_and_update_slots(
                         (cheapest_dec, int(slot_id)),
                     )
         conn.commit()
+    clear_db_cache()
     return log_ids
 
 
 def get_recent_alert_logs(limit: int = 50) -> list[dict[str, Any]]:
     """
-    Retrieve recent alert logs joined with destination and date_slot labels.
+    Retrieve recent alert logs joined with destination and date_slot labels (cached for 30s).
     """
+    cache_key = ("get_recent_alert_logs", int(limit))
+    hit, cached = _cache_get(cache_key)
+    if hit:
+        return cached
+
     query = """
         SELECT
             al.*,
@@ -1235,87 +1496,84 @@ def get_recent_alert_logs(limit: int = 50) -> list[dict[str, Any]]:
         item["cheapest_price"] = _to_float(item.get("cheapest_price"))
         item["best_price"] = _to_float(item.get("best_price"))
         results.append(item)
+    _cache_set(cache_key, results)
     return results
 
 
 def get_dashboard_summary() -> dict[str, Any]:
     """
-    Compute executive Top Metrics Ribbon KPIs and extraction source health stats.
+    Compute executive Top Metrics Ribbon KPIs and extraction source health stats
+    in a single SQL CTE round-trip (cached for 30s, invalidated on any write).
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    (SELECT COUNT(*) FROM destinations WHERE is_active = TRUE) AS active_destinations,
-                    (SELECT COUNT(*) FROM destinations) AS total_destinations,
-                    (SELECT COUNT(*) FROM date_slots ds JOIN destinations d ON d.id = ds.destination_id WHERE ds.is_active = TRUE AND d.is_active = TRUE) AS active_date_slots,
-                    (
-                        SELECT COUNT(*)
-                        FROM date_slots ds
-                        JOIN destinations d ON d.id = ds.destination_id
-                        WHERE ds.is_active = TRUE AND d.is_active = TRUE
-                          AND ds.outbound_date::date <= CURRENT_DATE + INTERVAL '330 days'
-                          AND ds.outbound_date::date >= CURRENT_DATE
-                          AND (ds.return_date IS NULL OR ds.return_date::date <= CURRENT_DATE + INTERVAL '330 days')
-                    ) AS slots_in_window,
-                    (
-                        SELECT COUNT(*)
-                        FROM date_slots ds
-                        JOIN destinations d ON d.id = ds.destination_id
-                        WHERE ds.is_active = TRUE AND d.is_active = TRUE
-                          AND (
-                              ds.outbound_date::date > CURRENT_DATE + INTERVAL '330 days'
-                              OR ds.return_date::date > CURRENT_DATE + INTERVAL '330 days'
-                          )
-                    ) AS slots_pending_release,
-                    (SELECT COUNT(*) FROM date_slots) AS total_date_slots,
-                    (
-                        SELECT COUNT(*)
-                        FROM date_slots ds
-                        JOIN destinations d ON d.id = ds.destination_id
-                        WHERE ds.is_active = TRUE
-                          AND d.is_active = TRUE
-                          AND ds.latest_cheapest_price IS NOT NULL
-                          AND ds.latest_cheapest_price <= d.target_price
-                    ) AS slots_below_target;
-                """
-            )
-            counts_row = cur.fetchone()
-            counts = dict(counts_row) if counts_row else {}
+    cache_key = ("get_dashboard_summary",)
+    hit, cached = _cache_get(cache_key)
+    if hit:
+        return cached
 
-            # Best deal across all active dates
-            cur.execute(
-                """
-                SELECT
-                    ds.id AS slot_id,
-                    ds.label,
-                    ds.outbound_date,
-                    ds.return_date,
-                    ds.latest_cheapest_price,
-                    ds.latest_best_price,
-                    ds.latest_airline,
-                    ds.latest_origin_airport,
-                    ds.latest_destination_airport,
-                    d.name AS destination_name,
-                    d.origin,
-                    d.destination AS destination_code,
-                    d.currency,
-                    d.target_price
-                FROM date_slots ds
-                JOIN destinations d ON d.id = ds.destination_id
-                WHERE ds.is_active = TRUE
-                  AND d.is_active = TRUE
-                  AND ds.latest_cheapest_price IS NOT NULL
-                ORDER BY (ds.latest_cheapest_price - d.target_price) ASC, ds.latest_cheapest_price ASC
-                LIMIT 1;
-                """
-            )
-            best_deal = cur.fetchone()
-
-            # Extraction source distribution (last 7 days)
-            cur.execute(
-                """
+    cte_query = """
+        WITH dest_counts AS (
+            SELECT
+                COUNT(*) FILTER (WHERE is_active = TRUE) AS active_destinations,
+                COUNT(*) AS total_destinations
+            FROM destinations
+        ),
+        slot_counts AS (
+            SELECT
+                COUNT(*) AS total_date_slots,
+                COUNT(*) FILTER (WHERE ds.is_active = TRUE AND d.is_active = TRUE) AS active_date_slots,
+                COUNT(*) FILTER (
+                    WHERE ds.is_active = TRUE AND d.is_active = TRUE
+                      AND ds.outbound_date::date <= CURRENT_DATE + INTERVAL '330 days'
+                      AND ds.outbound_date::date >= CURRENT_DATE
+                      AND (ds.return_date IS NULL OR ds.return_date::date <= CURRENT_DATE + INTERVAL '330 days')
+                ) AS slots_in_window,
+                COUNT(*) FILTER (
+                    WHERE ds.is_active = TRUE AND d.is_active = TRUE
+                      AND (
+                          ds.outbound_date::date > CURRENT_DATE + INTERVAL '330 days'
+                          OR ds.return_date::date > CURRENT_DATE + INTERVAL '330 days'
+                      )
+                ) AS slots_pending_release,
+                COUNT(*) FILTER (
+                    WHERE ds.is_active = TRUE
+                      AND d.is_active = TRUE
+                      AND ds.latest_cheapest_price IS NOT NULL
+                      AND ds.latest_cheapest_price <= d.target_price
+                ) AS slots_below_target
+            FROM date_slots ds
+            JOIN destinations d ON d.id = ds.destination_id
+        ),
+        best_deal AS (
+            SELECT json_build_object(
+                'slot_id', ds.id,
+                'label', ds.label,
+                'outbound_date', ds.outbound_date,
+                'return_date', ds.return_date,
+                'latest_cheapest_price', ds.latest_cheapest_price,
+                'latest_best_price', ds.latest_best_price,
+                'latest_airline', ds.latest_airline,
+                'latest_origin_airport', ds.latest_origin_airport,
+                'latest_destination_airport', ds.latest_destination_airport,
+                'destination_name', d.name,
+                'origin', d.origin,
+                'destination_code', d.destination,
+                'currency', d.currency,
+                'target_price', d.target_price
+            ) AS deal_json
+            FROM date_slots ds
+            JOIN destinations d ON d.id = ds.destination_id
+            WHERE ds.is_active = TRUE
+              AND d.is_active = TRUE
+              AND ds.latest_cheapest_price IS NOT NULL
+            ORDER BY (ds.latest_cheapest_price - d.target_price) ASC, ds.latest_cheapest_price ASC
+            LIMIT 1
+        ),
+        sources AS (
+            SELECT COALESCE(
+                json_agg(src_row ORDER BY src_row.count DESC),
+                '[]'::json
+            ) AS sources_json
+            FROM (
                 SELECT
                     extraction_source,
                     COUNT(*) AS count,
@@ -1323,19 +1581,38 @@ def get_dashboard_summary() -> dict[str, Any]:
                 FROM price_snapshots
                 WHERE scraped_at >= NOW() - INTERVAL '7 days'
                 GROUP BY extraction_source
-                ORDER BY count DESC;
-                """
-            )
-            source_rows = cur.fetchall()
+            ) src_row
+        )
+        SELECT
+            dc.active_destinations,
+            dc.total_destinations,
+            sc.active_date_slots,
+            sc.slots_in_window,
+            sc.slots_pending_release,
+            sc.total_date_slots,
+            sc.slots_below_target,
+            (SELECT deal_json FROM best_deal) AS best_deal_json,
+            (SELECT sources_json FROM sources) AS sources_json
+        FROM dest_counts dc, slot_counts sc;
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(cte_query)
+            row = cur.fetchone()
+            counts = dict(row) if row else {}
 
+    best_deal_raw = counts.get("best_deal_json")
     best_deal_dict: Optional[dict[str, Any]] = None
-    if best_deal:
-        best_deal_dict = dict(best_deal)
+    if isinstance(best_deal_raw, dict):
+        best_deal_dict = dict(best_deal_raw)
         best_deal_dict["latest_cheapest_price"] = _to_float(best_deal_dict.get("latest_cheapest_price"))
         best_deal_dict["latest_best_price"] = _to_float(best_deal_dict.get("latest_best_price"))
         best_deal_dict["target_price"] = _to_float(best_deal_dict.get("target_price"))
 
-    return {
+    raw_sources = counts.get("sources_json") or []
+    sources_list = [dict(r) for r in raw_sources] if isinstance(raw_sources, list) else []
+
+    summary = {
         "active_destinations": int(counts.get("active_destinations") or 0),
         "total_destinations": int(counts.get("total_destinations") or 0),
         "active_date_slots": int(counts.get("active_date_slots") or 0),
@@ -1344,5 +1621,7 @@ def get_dashboard_summary() -> dict[str, Any]:
         "total_date_slots": int(counts.get("total_date_slots") or 0),
         "slots_below_target": int(counts.get("slots_below_target") or 0),
         "best_deal": best_deal_dict,
-        "extraction_sources": [dict(r) for r in source_rows],
+        "extraction_sources": sources_list,
     }
+    _cache_set(cache_key, summary)
+    return summary

@@ -199,6 +199,19 @@ def _format_time_tuple(t_list: Any) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def _looks_like_location_or_airport(text: str) -> bool:
+    """Return True if a candidate airline label actually describes an airport or city."""
+    if not text:
+        return True
+    cleaned = text.strip()
+    lowered = cleaned.lower()
+    if any(tok in lowered for tok in ("aeropuerto", "airport", "ciudad de ", "city of ")):
+        return True
+    if re.search(r",\s*[A-Z]{2}$", cleaned):
+        return True
+    return False
+
+
 def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optional[FlightOffer]:
     """
     Parse a single Google Flights itinerary array entry into a `FlightOffer`.
@@ -212,6 +225,11 @@ def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optio
 
     core = entry[0] if isinstance(entry[0], list) else entry
 
+    # Require non-empty flight legs so airport/destination metadata nodes are never treated as offers
+    legs = _safe_get(core, 2)
+    if not isinstance(legs, list) or len(legs) == 0:
+        return None
+
     # Extract airline(s): typically core[1] is `["Iberia"]` or core[0] is airline code
     airline_names: list[str] = []
     raw_airlines = _safe_get(core, 1)
@@ -220,57 +238,53 @@ def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optio
             if isinstance(item, str) and item.strip():
                 airline_names.append(item.strip())
 
-    # Extract flight legs: typically core[2] is a list of leg arrays
-    legs = _safe_get(core, 2)
-    if not isinstance(legs, list):
-        legs = []
-
-    if not airline_names and legs:
+    if not airline_names:
         for leg in legs:
             leg_airline = _safe_get(leg, 22, 3) or _safe_get(leg, 22, 0)
             if isinstance(leg_airline, str) and leg_airline.strip() and leg_airline not in airline_names:
                 airline_names.append(leg_airline.strip())
 
     airline_str = ", ".join(airline_names[:2]) if airline_names else "Aerolínea"
+    if _looks_like_location_or_airport(airline_str):
+        return None
 
-    # Extract total duration in minutes: typically core[9] is integer minutes
+    # Extract total duration in minutes and require positive duration
     raw_duration = _safe_get(core, 9)
     if not isinstance(raw_duration, (int, float)) or raw_duration <= 0:
-        # Sum leg durations if core[9] is unavailable
         leg_mins = [
             _safe_get(leg, 11)
             for leg in legs
             if isinstance(_safe_get(leg, 11), (int, float))
         ]
         raw_duration = sum(leg_mins) if leg_mins else 0
-    duration_str = format_minutes_to_duration(raw_duration) if raw_duration else "N/A"
+    if not isinstance(raw_duration, (int, float)) or raw_duration <= 0:
+        return None
+    duration_str = format_minutes_to_duration(raw_duration)
 
     # Stops count: len(legs) - 1
-    stop_count = max(0, len(legs) - 1) if legs else 0
+    stop_count = max(0, len(legs) - 1)
     stops_str = format_stops_label(stop_count)
 
     # Departure & arrival time string and winning IATA airport codes from first and last leg
     dep_arr_str = ""
     dep_iata_clean: Optional[str] = None
     arr_iata_clean: Optional[str] = None
-    if legs:
-        first_leg = legs[0]
-        last_leg = legs[-1]
-        dep_time = _format_time_tuple(_safe_get(first_leg, 8))
-        arr_time = _format_time_tuple(_safe_get(last_leg, 10))
-        raw_dep_iata = _safe_get(first_leg, 3) or _safe_get(core, 3) or ""
-        raw_arr_iata = _safe_get(last_leg, 6) or _safe_get(core, 6) or ""
-        if isinstance(raw_dep_iata, str) and re.match(r"^[A-Z]{3}$", raw_dep_iata.strip().upper()):
-            dep_iata_clean = raw_dep_iata.strip().upper()
-        if isinstance(raw_arr_iata, str) and re.match(r"^[A-Z]{3}$", raw_arr_iata.strip().upper()):
-            arr_iata_clean = raw_arr_iata.strip().upper()
-        if dep_time and arr_time:
-            route_suffix = (
-                f" ({dep_iata_clean}-{arr_iata_clean})"
-                if dep_iata_clean and arr_iata_clean
-                else ""
-            )
-            dep_arr_str = f"{dep_time} - {arr_time}{route_suffix}"
+    first_leg = legs[0]
+    last_leg = legs[-1]
+    dep_time = _format_time_tuple(_safe_get(first_leg, 8))
+    arr_time = _format_time_tuple(_safe_get(last_leg, 10))
+    raw_dep_iata = _safe_get(first_leg, 3) or _safe_get(core, 3) or ""
+    raw_arr_iata = _safe_get(last_leg, 6) or _safe_get(core, 6) or ""
+    if isinstance(raw_dep_iata, str) and re.match(r"^[A-Z]{3}$", raw_dep_iata.strip().upper()):
+        dep_iata_clean = raw_dep_iata.strip().upper()
+    if isinstance(raw_arr_iata, str) and re.match(r"^[A-Z]{3}$", raw_arr_iata.strip().upper()):
+        arr_iata_clean = raw_arr_iata.strip().upper()
+
+    if not (dep_iata_clean and arr_iata_clean):
+        return None
+
+    if dep_time and arr_time:
+        dep_arr_str = f"{dep_time} - {arr_time} ({dep_iata_clean}-{arr_iata_clean})"
 
     # Check self-transfer indicators in entry JSON dump
     serialized_entry = json.dumps(entry, ensure_ascii=False)
@@ -404,14 +418,14 @@ def parse_shopping_rpc_response(raw_body: str) -> list[FlightOffer]:
 
 
 PRICE_PATTERNS = (
-    # Explicit currency prefix ($14,520, MX$14,520, Desde 14,520)
+    # Explicit currency prefix ($14,520, MX$14,520, US$800, €650)
     re.compile(
-        r"(?:MX\$|US\$|\$|EUR|€|Desde\s+)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
+        r"(?:MX\$|US\$|\$|EUR|€)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
         re.IGNORECASE,
     ),
     # Explicit currency suffix (14,520 MXN, 31.295 MXN, 14520 pesos)
     re.compile(
-        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|pesos|dólares)",
+        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|COP|CAD|pesos|dólares)",
         re.IGNORECASE,
     ),
     # Formatted thousands with comma or dot (31.295, 14,520) not followed by non-price units
@@ -422,7 +436,7 @@ PRICE_PATTERNS = (
 )
 
 DURATION_PATTERN = re.compile(
-    r"(\d{1,2}\s*(?:h|hr|hrs|horas?)\s*(?:\d{1,2}\s*(?:m|min|minutos?))?|\d{1,2}\s*(?:m|min|minutos?))",
+    r"\b(\d{1,2}\s*(?:h|hr|hrs|horas?)(?:\s*\d{1,2}\s*(?:m|min|minutos?)\b)?|\d{1,2}\s*(?:min|minutos?))\b",
     re.IGNORECASE,
 )
 
@@ -532,13 +546,14 @@ def extract_route_iatas_from_card(
 
 def parse_price_number(raw_price_text: str) -> Optional[float]:
     """
-    Parse a price string such as `"$14,520 MXN"`, `"14.520"`, or `"Desde 14,520 pesos mexicanos"`
-    into a clean float (`14520.0`).
+    Parse a price string such as `"$14,520 MXN"`, `"14.520"`, or `"Desde $14,520 MXN"`
+    into a clean float (`14520.0`). Rejects bare years (1900..2100) when no currency token is present.
     """
     if not raw_price_text:
         return None
 
-    for pattern in PRICE_PATTERNS:
+    for idx, pattern in enumerate(PRICE_PATTERNS):
+        has_currency_context = idx < 2
         for match in pattern.finditer(raw_price_text):
             num_str = match.group(1).strip()
             # Remove thousands separators (comma, dot when followed by 3 digits, or thin space)
@@ -547,6 +562,8 @@ def parse_price_number(raw_price_text: str) -> Optional[float]:
                 normalized = normalized.replace(".", "")
             try:
                 val = float(normalized)
+                if not has_currency_context and 1900 <= val <= 2100:
+                    continue
                 # Filter out flight numbers or hours/years that aren't airfare amounts
                 if 150 <= val <= 1_500_000:
                     return round(val, 2)
@@ -628,6 +645,13 @@ def parse_flight_card_text(
 
     if not airline:
         airline = "Aerolínea"
+
+    # Require real itinerary card fields: valid duration AND departure-arrival time range,
+    # and reject city/airport promo cards or unparsed generic placeholders.
+    if duration == "N/A" or not dep_arr:
+        return None
+    if airline == "Aerolínea" or _looks_like_location_or_airport(airline):
+        return None
 
     orig_iata, dest_iata = extract_route_iatas_from_card(
         aria_label=aria_label,

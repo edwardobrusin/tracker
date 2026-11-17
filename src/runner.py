@@ -91,7 +91,7 @@ def run_sharded_dispatcher(
         slots_by_dest[d_id].append(slot)
 
     # Assign each destination to a proxy from the verified pool (round-robin sharding)
-    proxy_pool = get_proxy_pool()
+    proxy_pool = get_proxy_pool(verify_tunnel=True)
     proxy_groups: dict[Optional[str], list[int]] = collections.OrderedDict()
     for idx, d_id in enumerate(slots_by_dest.keys()):
         assigned_proxy = proxy_pool[idx % len(proxy_pool)]
