@@ -150,6 +150,9 @@ CREATE INDEX IF NOT EXISTS idx_price_snapshots_dest_time
 
 CREATE INDEX IF NOT EXISTS idx_alert_logs_dest_sent
     ON alert_logs(destination_id, sent_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_destinations_unique_name
+    ON destinations (LOWER(TRIM(name)));
 """
 
 MIGRATION_SQL = """
@@ -175,6 +178,9 @@ ALTER TABLE IF EXISTS price_snapshots
     ADD COLUMN IF NOT EXISTS destination_airport VARCHAR(10),
     ADD COLUMN IF NOT EXISTS best_origin_airport VARCHAR(10),
     ADD COLUMN IF NOT EXISTS best_destination_airport VARCHAR(10);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_destinations_unique_name
+    ON destinations (LOWER(TRIM(name)));
 """
 
 
@@ -317,6 +323,42 @@ def get_destination(destination_id: int) -> Optional[dict[str, Any]]:
     return item
 
 
+def _validate_unique_destination_name(
+    cur: Any,
+    raw_name: str,
+    exclude_id: Optional[int] = None,
+) -> str:
+    """
+    Validate that a destination name is non-empty and does not collide
+    (case-insensitive, trimmed) with an existing destination.
+    """
+    clean_name = raw_name.strip()
+    if not clean_name:
+        raise ValueError("El nombre del destino no puede estar vacío.")
+
+    if exclude_id is None:
+        cur.execute(
+            "SELECT id, name FROM destinations WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s));",
+            (clean_name,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, name FROM destinations WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s)) AND id != %s;",
+            (clean_name, exclude_id),
+        )
+    existing = cur.fetchone()
+    if existing:
+        if exclude_id is None:
+            raise ValueError(
+                f"Ya existe un destino llamado '{existing['name']}'. "
+                "Selecciónalo en la lista para editarlo en lugar de crear uno duplicado."
+            )
+        raise ValueError(
+            f"Ya existe otro destino llamado '{existing['name']}'. Usa un nombre único."
+        )
+    return clean_name
+
+
 def create_destination(
     name: str,
     origin: str | list[str],
@@ -333,8 +375,8 @@ def create_destination(
 ) -> int:
     """
     Create a new N:M multi-airport destination corridor & filter profile.
-    Validates and normalizes IATA lists (expanding metro codes like TYO -> NRT,HND)
-    and enforces the 10-destination active matrix limit when is_active=True.
+    Validates unique destination name, normalizes IATA lists (expanding metro codes
+    like TYO -> NRT,HND), and enforces the 10-destination active matrix limit when is_active=True.
     """
     origin_airports = parse_iata_list(origin, expand_metro=True)
     destination_airports = parse_iata_list(destination, expand_metro=True)
@@ -343,6 +385,8 @@ def create_destination(
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            clean_name = _validate_unique_destination_name(cur, name)
+
             if is_active:
                 cur.execute("SELECT COUNT(*) AS cnt FROM destinations WHERE is_active = TRUE;")
                 cnt_row = cur.fetchone()
@@ -365,7 +409,7 @@ def create_destination(
                 RETURNING id;
                 """,
                 (
-                    name.strip(),
+                    clean_name,
                     norm_origin,
                     norm_dest,
                     origin_airports,
@@ -386,7 +430,7 @@ def create_destination(
                 raise RuntimeError("Failed to create destination: no row returned.")
             new_id = int(row["id"])
         conn.commit()
-    logger.info("Created destination id=%d (%s: %s -> %s)", new_id, name, norm_origin, norm_dest)
+    logger.info("Created destination id=%d (%s: %s -> %s)", new_id, clean_name, norm_origin, norm_dest)
     return new_id
 
 
@@ -421,6 +465,8 @@ def update_destination(
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+            clean_name = _validate_unique_destination_name(cur, name, exclude_id=destination_id)
+
             if is_active:
                 cur.execute(
                     "SELECT COUNT(*) AS cnt FROM destinations WHERE is_active = TRUE AND id != %s;",
@@ -452,7 +498,7 @@ def update_destination(
                 WHERE id = %s;
                 """,
                 (
-                    name.strip(),
+                    clean_name,
                     norm_origin,
                     norm_dest,
                     origin_airports,

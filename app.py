@@ -357,7 +357,7 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
     """Render Tab 1: Corridor Banner, 10-Date Comparison Table, Heatmap, and Plotly Charts."""
     if not destinations:
         st.info(
-            "Aún no tienes destinos configurados. Ve a la pestaña **Tab 2 — Crear / Gestionar Destino y Generador de Fechas** "
+            "Aún no tienes destinos configurados. Ve a **Tab 2 — Destinos y Fechas** "
             "para crear tu primera ruta y sus fechas."
         )
         return
@@ -446,6 +446,8 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
     slots = list_date_slots(destination_id=selected_dest_id, active_only=False)
     if not slots:
         st.warning("Este destino aún no tiene fechas registradas. Agrégalas en la Pestaña 2.")
+        if selected_dest:
+            _render_destination_management_drawer(selected_dest, slots)
         return
 
     # --------------------------------------------------------------------------
@@ -760,6 +762,14 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
     # --------------------------------------------------------------------------
     # DESTINATION & SLOTS MANAGEMENT DRAWER
     # --------------------------------------------------------------------------
+    _render_destination_management_drawer(selected_dest, slots)
+
+
+def _render_destination_management_drawer(
+    selected_dest: Optional[dict[str, Any]],
+    slots: list[dict[str, Any]],
+) -> None:
+    """Render destination pause/activate/delete and individual slot management controls."""
     with st.expander("Administrar Destino y Fechas (Pausar / Activar / Eliminar)"):
         if selected_dest:
             d_col1, d_col2, d_col3 = st.columns([2, 1, 1])
@@ -788,34 +798,35 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
                     st.success("Destino y sus slots eliminados.")
                     st.rerun()
 
-        st.markdown("##### Fechas Individuales de este Destino")
-        for s in slots:
-            sc1, sc2, sc3, sc4 = st.columns([3, 1.5, 1, 1])
-            with sc1:
-                win = s.get("window_info") or get_flight_window_status(s.get("outbound_date"), s.get("return_date"))
-                st.write(
-                    f"[{'Activo' if s.get('is_active') else 'Pausado'}] **{s.get('label') or s.get('outbound_date')}** "
-                    f"({win['badge']})"
-                )
-            with sc2:
-                p_val = s.get("latest_cheapest_price")
-                st.write(f"${p_val:,.0f}" if p_val else "Sin escaneo")
-            with sc3:
-                toggle_slot_state = not bool(s.get("is_active", True))
-                if st.button(
-                    "Activar" if toggle_slot_state else "Pausar",
-                    key=f"tog_slot_{s['id']}",
-                    width="stretch",
-                ):
-                    try:
-                        set_date_slot_active(int(s["id"]), toggle_slot_state)
+        if slots:
+            st.markdown("##### Fechas Individuales de este Destino")
+            for s in slots:
+                sc1, sc2, sc3, sc4 = st.columns([3, 1.5, 1, 1])
+                with sc1:
+                    win = s.get("window_info") or get_flight_window_status(s.get("outbound_date"), s.get("return_date"))
+                    st.write(
+                        f"[{'Activo' if s.get('is_active') else 'Pausado'}] **{s.get('label') or s.get('outbound_date')}** "
+                        f"({win['badge']})"
+                    )
+                with sc2:
+                    p_val = s.get("latest_cheapest_price")
+                    st.write(f"${p_val:,.0f}" if p_val else "Sin escaneo")
+                with sc3:
+                    toggle_slot_state = not bool(s.get("is_active", True))
+                    if st.button(
+                        "Activar" if toggle_slot_state else "Pausar",
+                        key=f"tog_slot_{s['id']}",
+                        width="stretch",
+                    ):
+                        try:
+                            set_date_slot_active(int(s["id"]), toggle_slot_state)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                with sc4:
+                    if st.button("Borrar", key=f"del_slot_{s['id']}", width="stretch"):
+                        delete_date_slot(int(s["id"]))
                         st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-            with sc4:
-                if st.button("Borrar", key=f"del_slot_{s['id']}", width="stretch"):
-                    delete_date_slot(int(s["id"]))
-                    st.rerun()
 
 
 # ==============================================================================
@@ -826,28 +837,30 @@ def render_tab1_matrix_explorer(destinations: list[dict[str, Any]]) -> None:
 def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) -> None:
     """
     Render Tab 2:
-      Step 1: Configure Destination & Filter Profile
-      Step 2: Add up to 10 Date Combinations (Option A, Option B with Single-Calendar Range, Option C)
+      1. Destination & Filter Profile (Create / Edit / Delete, duplicate-protected)
+      2. Travel Dates (Calendar Range, Auto-Generator, or Paste URLs)
     """
-    st.markdown("### Paso 1: Configurar Corredor de Vuelo y Perfil de Filtros")
+    st.markdown("### 1. Destino y Filtros")
 
     mode_options: list[tuple[Optional[int], str]] = [
-        (None, "Crear Nuevo Destino (Ruta + Perfil de Filtros)")
+        (None, "➕ Crear nuevo destino")
     ]
     for d in destinations:
         mode_options.append(
             (
                 int(d["id"]),
-                f"Editar Destino Existente: {d['name']} ({d['origin']} ➔ {d['destination']})",
+                f"Editar: {d['name']} ({d['origin']} ➔ {d['destination']})",
             )
         )
 
-    selected_mode = st.selectbox(
-        "Seleccionar Acción sobre Destino",
-        options=mode_options,
-        format_func=lambda x: str(x[1]),
-        key="tab2_dest_mode",
-    )
+    sel_col, del_col = st.columns([4, 1])
+    with sel_col:
+        selected_mode = st.selectbox(
+            "Destino",
+            options=mode_options,
+            format_func=lambda x: str(x[1]),
+            key="tab2_dest_mode",
+        )
     editing_dest_id: Optional[int] = selected_mode[0]
     existing_dest = (
         next((d for d in destinations if int(d["id"]) == editing_dest_id), None)
@@ -856,237 +869,316 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
     )
     existing_cfg = FilterProfile.from_dict(existing_dest.get("filter_config") if existing_dest else {})
 
-    with st.form("destination_profile_form", clear_on_submit=False):
-        r1c1, r1c2, r1c3, r1c4 = st.columns([2.0, 1.2, 1.2, 1.1])
+    with del_col:
+        if existing_dest is not None:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            with st.popover("🗑 Eliminar", width="stretch"):
+                st.warning(
+                    f"¿Eliminar **{existing_dest['name']}** y todas sus fechas e historial?"
+                )
+                if st.button(
+                    "Sí, eliminar",
+                    key=f"tab2_confirm_del_{editing_dest_id}",
+                    type="primary",
+                    width="stretch",
+                ):
+                    delete_destination(int(editing_dest_id))
+                    if st.session_state.get("last_created_dest_id") == editing_dest_id:
+                        st.session_state.pop("last_created_dest_id", None)
+                    st.success(f"Destino **{existing_dest['name']}** eliminado.")
+                    st.rerun()
+
+    key_suffix = str(editing_dest_id) if editing_dest_id is not None else "new"
+    has_custom_filters = bool(
+        existing_dest
+        and (
+            existing_cfg.max_stops is not None
+            or existing_cfg.airlines
+            or existing_cfg.carry_on_bags > 0
+            or existing_cfg.adults != 1
+            or existing_cfg.hide_self_transfer
+            or existing_cfg.dep_start_hour != 0
+            or existing_cfg.dep_end_hour != 23
+            or existing_cfg.arr_start_hour != 0
+            or existing_cfg.arr_end_hour != 23
+        )
+    )
+
+    with st.form(f"destination_profile_form_{key_suffix}", clear_on_submit=False):
+        r1c1, r1c2, r1c3, r1c4 = st.columns([1.8, 1.1, 1.1, 1.0])
         with r1c1:
             name_val = st.text_input(
-                "Nombre del Destino / Corredor",
-                value=existing_dest["name"] if existing_dest else "CDMX Multi -> Tokio Multi (Otoño)",
-                placeholder="Ej. CDMX Multi -> Tokio (Otoño)",
+                "Nombre",
+                value=existing_dest["name"] if existing_dest else "",
+                placeholder="Ej. Tokio (Otoño)",
+                key=f"dest_name_{key_suffix}",
             )
         with r1c2:
             origin_val = st.text_input(
-                "Orígenes IATA (1 o más, sep. por coma)",
+                "Orígenes",
                 value=existing_dest["origin"] if existing_dest else "MEX, NLU",
                 max_chars=64,
-                placeholder="Ej. MEX, NLU, TLC",
-                help="Ingresa uno o varios aeropuertos separados por coma (ej. MEX, NLU, TLC). Se consultan juntos en 1 sola llamada.",
+                placeholder="MEX, NLU",
+                help="Códigos IATA separados por coma (ej. MEX, NLU).",
+                key=f"dest_origin_{key_suffix}",
             ).upper()
         with r1c3:
             dest_val = st.text_input(
-                "Destinos IATA (1 o más, sep. por coma)",
+                "Destinos",
                 value=existing_dest["destination"] if existing_dest else "NRT, HND",
                 max_chars=64,
-                placeholder="Ej. NRT, HND o TYO",
-                help="Ingresa uno o varios aeropuertos (ej. NRT, HND o MAD, BCN) o códigos metropolitanos (TYO, LON, NYC, PAR).",
+                placeholder="NRT, HND o TYO",
+                help="Aeropuertos o códigos de ciudad (TYO, LON, NYC, PAR).",
+                key=f"dest_code_{key_suffix}",
             ).upper()
         with r1c4:
             trip_type_val = st.selectbox(
-                "Tipo de Viaje",
+                "Viaje",
                 options=["round-trip", "one-way"],
                 index=0 if (not existing_dest or existing_dest.get("trip_type") == "round-trip") else 1,
-                format_func=lambda t: "Redondo (Ida y Vuelta)" if t == "round-trip" else "Sencillo (Solo Ida)",
+                format_func=lambda t: "Redondo" if t == "round-trip" else "Solo ida",
+                key=f"dest_trip_{key_suffix}",
             )
 
-        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1.4, 1.2, 1.2, 1, 1])
+        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1.1, 0.9, 1.0, 1.0, 1.0])
         with r2c1:
             target_price_val = st.number_input(
-                "Precio Meta (Target Price)",
+                "Precio meta",
                 min_value=100.0,
                 max_value=500000.0,
                 value=float(existing_dest["target_price"]) if existing_dest else 16000.0,
                 step=250.0,
+                key=f"dest_target_{key_suffix}",
             )
         with r2c2:
+            currencies = ["MXN", "USD", "EUR", "CAD", "COP"]
+            curr_val = existing_dest.get("currency", "MXN") if existing_dest else "MXN"
+            currency_val = st.selectbox(
+                "Moneda",
+                options=currencies,
+                index=currencies.index(curr_val) if curr_val in currencies else 0,
+                key=f"dest_curr_{key_suffix}",
+            )
+        with r2c3:
+            cabins = ["economy", "premium-economy", "business", "first"]
+            seat_val = st.selectbox(
+                "Cabina",
+                options=cabins,
+                index=cabins.index(existing_cfg.seat) if existing_cfg.seat in cabins else 0,
+                format_func=lambda s: {
+                    "economy": "Turista",
+                    "premium-economy": "Premium",
+                    "business": "Ejecutiva",
+                    "first": "Primera",
+                }[s],
+                key=f"dest_seat_{key_suffix}",
+            )
+        with r2c4:
             interval_choices = [60, 180, 360]
             curr_interval = int(existing_dest.get("check_interval_minutes", 60)) if existing_dest else 60
             interval_idx = interval_choices.index(curr_interval) if curr_interval in interval_choices else 0
             check_interval_val = st.selectbox(
-                "Frecuencia de Escaneo",
+                "Escaneo",
                 options=interval_choices,
                 index=interval_idx,
-                format_func=lambda m: f"Cada {m // 60}h ({m} min)",
-            )
-        with r2c3:
-            cooldown_val = st.selectbox(
-                "Cooldown de Alertas",
-                options=[6, 12, 24],
-                index=1 if not existing_dest else ([6, 12, 24].index(int(existing_dest.get("cooldown_hours", 12))) if int(existing_dest.get("cooldown_hours", 12)) in (6, 12, 24) else 1),
-                format_func=lambda h: f"{h} horas (salvo -5% extra)",
-            )
-        with r2c4:
-            currency_val = st.selectbox(
-                "Moneda (`curr`)",
-                options=["MXN", "USD", "EUR", "CAD", "COP"],
-                index=0 if not existing_dest else (["MXN", "USD", "EUR", "CAD", "COP"].index(existing_dest.get("currency", "MXN")) if existing_dest.get("currency", "MXN") in ["MXN", "USD", "EUR", "CAD", "COP"] else 0),
+                format_func=lambda m: f"Cada {m // 60}h",
+                key=f"dest_interval_{key_suffix}",
             )
         with r2c5:
-            seat_val = st.selectbox(
-                "Cabina",
-                options=["economy", "premium-economy", "business", "first"],
-                index=["economy", "premium-economy", "business", "first"].index(existing_cfg.seat)
-                if existing_cfg.seat in ["economy", "premium-economy", "business", "first"]
-                else 0,
-                format_func=lambda s: {
-                    "economy": "Turista",
-                    "premium-economy": "Premium Econ",
-                    "business": "Ejecutiva",
-                    "first": "Primera",
-                }[s],
+            cooldown_choices = [6, 12, 24]
+            curr_cd = int(existing_dest.get("cooldown_hours", 12)) if existing_dest else 12
+            cooldown_val = st.selectbox(
+                "Cooldown",
+                options=cooldown_choices,
+                index=cooldown_choices.index(curr_cd) if curr_cd in cooldown_choices else 1,
+                format_func=lambda h: f"{h} horas",
+                help="Espera mínima entre alertas (salvo caída adicional de -5%).",
+                key=f"dest_cooldown_{key_suffix}",
             )
 
-        st.markdown("##### Filtros Avanzados Protobuf (`?tfs=`)")
-        f1, f2, f3, f4 = st.columns([1.2, 2.2, 1, 1])
-        with f1:
-            stops_options = [None, 0, 1, 2]
-            stops_idx = stops_options.index(existing_cfg.max_stops) if existing_cfg.max_stops in stops_options else 0
-            max_stops_val = st.selectbox(
-                "Escalas Máximas",
-                options=stops_options,
-                index=stops_idx,
-                format_func=lambda s: {
-                    None: "Cualquier escala",
-                    0: "0 — Solo vuelos directos",
-                    1: "1 — Máximo 1 escala",
-                    2: "2 — Máximo 2 escalas",
-                }[s],
-            )
-        with f2:
-            default_airlines = [a for a in existing_cfg.airlines if a in COMMON_AIRLINES]
-            selected_airlines = st.multiselect(
-                "Aerolíneas Permitidas (Opcional — vacío = todas)",
-                options=list(COMMON_AIRLINES.keys()),
-                default=default_airlines,
-                format_func=lambda k: str(COMMON_AIRLINES.get(str(k), str(k))),
-            )
-        with f3:
-            carry_on_val = st.selectbox(
-                "Equipaje de Mano",
-                options=[0, 1, 2],
-                index=min(2, max(0, existing_cfg.carry_on_bags)),
-                format_func=lambda b: "Sin filtro (0)" if b == 0 else f"{b} maleta(s)",
-            )
-        with f4:
-            adults_val = st.number_input(
-                "Pasajeros",
-                min_value=1,
-                max_value=9,
-                value=existing_cfg.adults,
-                step=1,
-            )
+        with st.expander("Filtros opcionales", expanded=has_custom_filters):
+            f1, f2, f3, f4 = st.columns([1.1, 2.0, 1.0, 0.9])
+            with f1:
+                stops_options = [None, 0, 1, 2]
+                stops_idx = stops_options.index(existing_cfg.max_stops) if existing_cfg.max_stops in stops_options else 0
+                max_stops_val = st.selectbox(
+                    "Escalas",
+                    options=stops_options,
+                    index=stops_idx,
+                    format_func=lambda s: {
+                        None: "Cualquiera",
+                        0: "Directo",
+                        1: "Máx. 1 escala",
+                        2: "Máx. 2 escalas",
+                    }[s],
+                    key=f"dest_stops_{key_suffix}",
+                )
+            with f2:
+                default_airlines = [a for a in existing_cfg.airlines if a in COMMON_AIRLINES]
+                selected_airlines = st.multiselect(
+                    "Aerolíneas",
+                    options=list(COMMON_AIRLINES.keys()),
+                    default=default_airlines,
+                    placeholder="Todas",
+                    format_func=lambda k: str(COMMON_AIRLINES.get(str(k), str(k))),
+                    key=f"dest_airlines_{key_suffix}",
+                )
+            with f3:
+                carry_on_val = st.selectbox(
+                    "Equipaje de mano",
+                    options=[0, 1, 2],
+                    index=min(2, max(0, existing_cfg.carry_on_bags)),
+                    format_func=lambda b: "Sin filtro" if b == 0 else f"{b} maleta(s)",
+                    key=f"dest_bags_{key_suffix}",
+                )
+            with f4:
+                adults_val = st.number_input(
+                    "Pasajeros",
+                    min_value=1,
+                    max_value=9,
+                    value=existing_cfg.adults,
+                    step=1,
+                    key=f"dest_adults_{key_suffix}",
+                )
 
-        h1, h2, h3 = st.columns([1.5, 1.5, 1.2])
-        with h1:
-            dep_window = st.slider(
-                "Horario de Salida (00:00 - 23:59)",
-                min_value=0,
-                max_value=23,
-                value=(existing_cfg.dep_start_hour, existing_cfg.dep_end_hour),
-            )
-        with h2:
-            arr_window = st.slider(
-                "Horario de Llegada (00:00 - 23:59)",
-                min_value=0,
-                max_value=23,
-                value=(existing_cfg.arr_start_hour, existing_cfg.arr_end_hour),
-            )
-        with h3:
-            custom_iata_str = st.text_input(
-                "Aerolíneas IATA Adicionales (separadas por coma)",
-                value=",".join([a for a in existing_cfg.airlines if a not in COMMON_AIRLINES]),
-                placeholder="Ej. NH, JL",
-            )
-            hide_self_transfer_val = st.checkbox(
-                "Ocultar vuelos Self-Transfer",
-                value=existing_cfg.hide_self_transfer,
-            )
+            h1, h2, h3 = st.columns([1.4, 1.4, 1.2])
+            with h1:
+                dep_window = st.slider(
+                    "Hora de salida",
+                    min_value=0,
+                    max_value=23,
+                    value=(existing_cfg.dep_start_hour, existing_cfg.dep_end_hour),
+                    key=f"dest_dep_{key_suffix}",
+                )
+            with h2:
+                arr_window = st.slider(
+                    "Hora de llegada",
+                    min_value=0,
+                    max_value=23,
+                    value=(existing_cfg.arr_start_hour, existing_cfg.arr_end_hour),
+                    key=f"dest_arr_{key_suffix}",
+                )
+            with h3:
+                custom_iata_str = st.text_input(
+                    "Otras aerolíneas (IATA)",
+                    value=",".join([a for a in existing_cfg.airlines if a not in COMMON_AIRLINES]),
+                    placeholder="Ej. NH, JL",
+                    key=f"dest_extra_airlines_{key_suffix}",
+                )
+                hide_self_transfer_val = st.checkbox(
+                    "Evitar self-transfer",
+                    value=existing_cfg.hide_self_transfer,
+                    help="Ocultar vuelos con cambio de boleto por cuenta propia.",
+                    key=f"dest_self_trf_{key_suffix}",
+                )
 
-        submit_btn_text = (
-            "Actualizar Perfil del Destino" if editing_dest_id is not None else "Crear Destino en Matrix"
-        )
-        submitted_dest = st.form_submit_button(submit_btn_text, width="stretch")
+        submit_btn_text = "Guardar cambios" if editing_dest_id is not None else "Crear destino"
+        submitted_dest = st.form_submit_button(submit_btn_text, type="primary", width="stretch")
 
         if submitted_dest:
-            merged_airlines = list(selected_airlines)
-            for extra in custom_iata_str.split(","):
-                code = extra.strip().upper()
-                if code and code not in merged_airlines:
-                    merged_airlines.append(code)
-
-            profile_obj = FilterProfile(
-                max_stops=max_stops_val,
-                airlines=merged_airlines,
-                dep_start_hour=dep_window[0],
-                dep_end_hour=dep_window[1],
-                arr_start_hour=arr_window[0],
-                arr_end_hour=arr_window[1],
-                ret_dep_start_hour=dep_window[0],
-                ret_dep_end_hour=dep_window[1],
-                ret_arr_start_hour=arr_window[0],
-                ret_arr_end_hour=arr_window[1],
-                carry_on_bags=carry_on_val,
-                seat=seat_val,
-                adults=int(adults_val),
-                hide_self_transfer=hide_self_transfer_val,
-            )
-
-            try:
-                norm_orig = normalize_iata_codes(origin_val, expand_metro=True)
-                norm_dest = normalize_iata_codes(dest_val, expand_metro=True)
-                corridor_disp = format_corridor_display(norm_orig, norm_dest)
-
-                if editing_dest_id is None:
-                    new_id = create_destination(
-                        name=name_val,
-                        origin=norm_orig,
-                        destination=norm_dest,
-                        target_price=float(target_price_val),
-                        trip_type=trip_type_val,
-                        currency=currency_val,
-                        gl=DEFAULT_GL,
-                        hl=DEFAULT_HL,
-                        check_interval_minutes=int(check_interval_val),
-                        cooldown_hours=int(cooldown_val),
-                        filter_config=profile_obj.to_dict(),
-                        is_active=True,
-                    )
-                    st.session_state["last_created_dest_id"] = new_id
-                    st.success(
-                        f"Destino **{name_val}** (`{corridor_disp}`) creado (ID #{new_id}). "
-                        "Ahora agrega hasta 10 combinaciones de fechas en el Paso 2 abajo."
-                    )
-                    st.rerun()
+            clean_name = name_val.strip()
+            if not clean_name:
+                st.error("Ingresa un nombre para el destino.")
+            else:
+                duplicate_match = next(
+                    (
+                        d
+                        for d in destinations
+                        if d["name"].strip().lower() == clean_name.lower()
+                        and (editing_dest_id is None or int(d["id"]) != editing_dest_id)
+                    ),
+                    None,
+                )
+                if duplicate_match is not None:
+                    if editing_dest_id is None:
+                        st.error(
+                            f"Ya existe un destino llamado **{duplicate_match['name']}**. "
+                            "Selecciónalo arriba para editarlo; no se permiten destinos duplicados."
+                        )
+                    else:
+                        st.error(
+                            f"Ya existe otro destino llamado **{duplicate_match['name']}**. "
+                            "Elige un nombre diferente."
+                        )
                 else:
-                    update_destination(
-                        destination_id=editing_dest_id,
-                        name=name_val,
-                        origin=norm_orig,
-                        destination=norm_dest,
-                        target_price=float(target_price_val),
-                        trip_type=trip_type_val,
-                        currency=currency_val,
-                        gl=DEFAULT_GL,
-                        hl=DEFAULT_HL,
-                        check_interval_minutes=int(check_interval_val),
-                        cooldown_hours=int(cooldown_val),
-                        filter_config=profile_obj.to_dict(),
-                        is_active=bool(existing_dest.get("is_active", True)) if existing_dest else True,
+                    merged_airlines = list(selected_airlines)
+                    for extra in custom_iata_str.split(","):
+                        code = extra.strip().upper()
+                        if code and code not in merged_airlines:
+                            merged_airlines.append(code)
+
+                    profile_obj = FilterProfile(
+                        max_stops=max_stops_val,
+                        airlines=merged_airlines,
+                        dep_start_hour=dep_window[0],
+                        dep_end_hour=dep_window[1],
+                        arr_start_hour=arr_window[0],
+                        arr_end_hour=arr_window[1],
+                        ret_dep_start_hour=dep_window[0],
+                        ret_dep_end_hour=dep_window[1],
+                        ret_arr_start_hour=arr_window[0],
+                        ret_arr_end_hour=arr_window[1],
+                        carry_on_bags=carry_on_val,
+                        seat=seat_val,
+                        adults=int(adults_val),
+                        hide_self_transfer=hide_self_transfer_val,
                     )
-                    st.success(
-                        f"Perfil del destino **{name_val}** (`{corridor_disp}`) y sus URLs Protobuf actualizados correctamente."
-                    )
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"No se pudo guardar el destino: {exc}")
+
+                    try:
+                        norm_orig = normalize_iata_codes(origin_val, expand_metro=True)
+                        norm_dest = normalize_iata_codes(dest_val, expand_metro=True)
+                        corridor_disp = format_corridor_display(norm_orig, norm_dest)
+
+                        if editing_dest_id is None:
+                            new_id = create_destination(
+                                name=clean_name,
+                                origin=norm_orig,
+                                destination=norm_dest,
+                                target_price=float(target_price_val),
+                                trip_type=trip_type_val,
+                                currency=currency_val,
+                                gl=DEFAULT_GL,
+                                hl=DEFAULT_HL,
+                                check_interval_minutes=int(check_interval_val),
+                                cooldown_hours=int(cooldown_val),
+                                filter_config=profile_obj.to_dict(),
+                                is_active=True,
+                            )
+                            st.session_state["last_created_dest_id"] = new_id
+                            st.success(
+                                f"Destino **{clean_name}** (`{corridor_disp}`) creado. "
+                                "Ahora agrega sus fechas abajo."
+                            )
+                            st.rerun()
+                        else:
+                            update_destination(
+                                destination_id=editing_dest_id,
+                                name=clean_name,
+                                origin=norm_orig,
+                                destination=norm_dest,
+                                target_price=float(target_price_val),
+                                trip_type=trip_type_val,
+                                currency=currency_val,
+                                gl=DEFAULT_GL,
+                                hl=DEFAULT_HL,
+                                check_interval_minutes=int(check_interval_val),
+                                cooldown_hours=int(cooldown_val),
+                                filter_config=profile_obj.to_dict(),
+                                is_active=bool(existing_dest.get("is_active", True)) if existing_dest else True,
+                            )
+                            st.success(f"Destino **{clean_name}** (`{corridor_disp}`) actualizado.")
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo guardar el destino: {exc}")
 
     # --------------------------------------------------------------------------
-    # STEP 2: ADD UP TO 10 DATE COMBINATIONS (WITH 330-DAY INTELLIGENCE)
+    # STEP 2: TRAVEL DATES (UP TO 10 COMBINATIONS)
     # --------------------------------------------------------------------------
     st.markdown("---")
-    st.markdown("### Paso 2: Agregar hasta 10 Combinaciones de Fechas")
+    st.markdown("### 2. Fechas de Viaje")
 
     if not destinations:
-        st.info("Crea al menos un destino en el Paso 1 arriba para habilitar el selector de fechas.")
+        st.info("Crea al menos un destino arriba para agregar fechas.")
         return
 
     default_dest_idx = 0
@@ -1098,12 +1190,12 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 break
 
     target_dest = st.selectbox(
-        "Seleccionar Destino a Gestionar",
+        "Destino",
         options=destinations,
         index=default_dest_idx,
         format_func=lambda d: (
             f"{d['name']} ({d['origin']} ➔ {d['destination']}) — "
-            f"Slots activos: {d.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION}"
+            f"{d.get('active_slots', 0)}/{MAX_SLOTS_PER_DESTINATION} fechas"
         ),
         key="step2_target_dest",
     )
@@ -1117,37 +1209,32 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
     dest_hl = str(target_dest.get("hl", DEFAULT_HL))
     dest_profile = FilterProfile.from_dict(target_dest.get("filter_config"))
 
-    # Notice about 330-day window
     today = datetime.date.today()
     max_searchable_date = today + datetime.timedelta(days=GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS)
     st.caption(
-        f"**Ventana de 330 días:** Google Flights publica vuelos hasta el **{max_searchable_date.strftime('%d/%m/%Y')}**. "
-        "Si agregas fechas posteriores, el sistema las guardará y comenzará a rastrearlas automáticamente en cuanto las aerolíneas liberen sus itinerarios."
+        f"Google Flights muestra vuelos hasta el **{max_searchable_date.strftime('%d/%m/%Y')}** "
+        "(fechas posteriores quedan en espera automática)."
     )
 
     replace_mode = st.checkbox(
-        "Reemplazar las fechas actuales de este destino al guardar las nuevas combinaciones",
+        "Reemplazar fechas actuales",
         value=False,
         key="step2_replace_existing",
     )
 
     opt_b_tab, opt_a_tab, opt_c_tab = st.tabs(
         [
-            "Opción B — Selector Rango en 1 Solo Calendario (Recomendado)",
-            "Opción A — Generador Automático de Ventana de Viaje",
-            "Opción C — Pegar URLs de Google Flights",
+            "Calendario",
+            "Generador automático",
+            "Pegar URLs",
         ]
     )
 
     # --------------------------------------------------------------------------
-    # OPTION B: SINGLE-CALENDAR RANGE PICKER WITH STAGING TRAY (NEW UX)
+    # CALENDAR RANGE PICKER WITH STAGING TRAY
     # --------------------------------------------------------------------------
     with opt_b_tab:
-        st.markdown("##### Selecciona Rango en 1 Solo Calendario")
-        st.caption(
-            "Haz clic una vez para la fecha de salida y un segundo clic para el regreso. "
-            "Si haces clic en una fecha anterior, se reinicia como nueva salida automáticamente."
-        )
+        st.caption("Selecciona ida y vuelta en el calendario y agrégalas a la lista.")
 
         if "staged_slots_list" not in st.session_state:
             st.session_state["staged_slots_list"] = []
@@ -1157,12 +1244,12 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         default_cal_start = today + datetime.timedelta(days=21)
         default_cal_end = default_cal_start + datetime.timedelta(days=9)
 
-        cal_c1, cal_c2 = st.columns([1.5, 1.5])
+        cal_c1, cal_c2 = st.columns([1.4, 1.6])
 
         with cal_c1:
             if dest_trip == "one-way":
                 single_cal_val = st.date_input(
-                    "Fecha de Salida (Solo ida)",
+                    "Fecha de salida",
                     value=default_cal_start,
                     min_value=today,
                     key="opb_single_date",
@@ -1171,7 +1258,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 range_end = None
             else:
                 date_range_picker = st.date_input(
-                    "Rango de Fechas (Ida y Vuelta)",
+                    "Fechas (ida y vuelta)",
                     value=(default_cal_start, default_cal_end),
                     min_value=today,
                     key="opb_range_picker",
@@ -1186,32 +1273,31 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     range_end = None
 
         with cal_c2:
-            st.markdown("##### Vista Previa de Selección")
             if range_start:
                 out_str = range_start.strftime("%Y-%m-%d")
                 ret_str = range_end.strftime("%Y-%m-%d") if range_end else None
                 lbl = format_date_slot_label(out_str, ret_str)
                 win_status = get_flight_window_status(out_str, ret_str)
 
-                st.markdown(f"**Combinación:** `{lbl}`")
+                st.markdown(f"**Selección:** `{lbl}`")
                 if win_status["status"] == "ACTIVE_WINDOW":
-                    st.success(f"**Dentro de ventana activa:** Rastreo inmediato ({win_status['days_until_flight']} días para el vuelo)")
+                    st.success(f"Disponible para rastreo inmediato ({win_status['days_until_flight']} días)")
                 elif win_status["status"] == "FUTURE_RELEASE":
                     st.info(
-                        f"**En espera de liberación:** Google Flights abre esta fecha el **{win_status['release_date'].strftime('%d/%m/%Y')}** "
-                        f"(faltan {win_status['days_until_release']} días). Se guardará en pausa y se activará sola."
+                        f"Abre el **{win_status['release_date'].strftime('%d/%m/%Y')}** "
+                        f"(en {win_status['days_until_release']} días). Se activará automáticamente."
                     )
                 else:
                     st.warning("Fecha no disponible")
 
                 can_add = len(staged_slots) < MAX_SLOTS_PER_DESTINATION
-                add_btn_txt = f"Añadir a la Lista ({len(staged_slots)}/{MAX_SLOTS_PER_DESTINATION})" if can_add else "Lista Completa (Máx 10)"
+                add_btn_txt = f"Agregar ({len(staged_slots)}/{MAX_SLOTS_PER_DESTINATION})" if can_add else "Lista llena (10)"
 
                 b_add, b_shift7 = st.columns([1.2, 1])
                 with b_add:
                     if st.button(add_btn_txt, disabled=not can_add, key="btn_add_staged", type="primary", width="stretch"):
                         if any(s["outbound_date"] == out_str and s.get("return_date") == ret_str for s in staged_slots):
-                            st.warning("Esta combinación ya fue agregada a la lista.")
+                            st.warning("Esta fecha ya está en la lista.")
                         else:
                             slot_url = build_google_flights_url(
                                 origin=dest_origin,
@@ -1233,7 +1319,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                             })
                             st.rerun()
                 with b_shift7:
-                    if st.button("+7 Días Rápido", disabled=not can_add, key="btn_shift_7", width="stretch"):
+                    if st.button("+7 días", disabled=not can_add, key="btn_shift_7", width="stretch"):
                         shift_out = range_start + datetime.timedelta(days=7)
                         shift_ret = (range_end + datetime.timedelta(days=7)) if range_end else None
                         s_out_str = shift_out.strftime("%Y-%m-%d")
@@ -1264,14 +1350,14 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         st.markdown("---")
         tray_h1, tray_h2 = st.columns([3, 1])
         with tray_h1:
-            st.markdown(f"##### Fechas Seleccionadas para Guardar ({len(staged_slots)} / {MAX_SLOTS_PER_DESTINATION})")
+            st.markdown(f"##### Fechas por guardar ({len(staged_slots)}/{MAX_SLOTS_PER_DESTINATION})")
         with tray_h2:
-            if staged_slots and st.button("Limpiar Todo", key="btn_clear_staged", width="stretch"):
+            if staged_slots and st.button("Limpiar", key="btn_clear_staged", width="stretch"):
                 st.session_state["staged_slots_list"] = []
                 st.rerun()
 
         if not staged_slots:
-            st.info("Tu bandeja de fechas está vacía. Selecciona un rango en el calendario arriba y haz clic en **'Añadir a la Lista'**.")
+            st.info("Lista vacía. Selecciona fechas arriba y presiona **Agregar**.")
         else:
             for s_idx, slot in enumerate(staged_slots):
                 sc1, sc2, sc3 = st.columns([2.5, 2, 0.5])
@@ -1280,19 +1366,19 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 with sc2:
                     win = slot.get("window_info") or get_flight_window_status(slot.get("outbound_date"), slot.get("return_date"))
                     if win["status"] == "ACTIVE_WINDOW":
-                        st.markdown("<span class='status-pill-emerald'>En ventana activa</span>", unsafe_allow_html=True)
+                        st.markdown("<span class='status-pill-emerald'>Activa</span>", unsafe_allow_html=True)
                     elif win["status"] == "FUTURE_RELEASE":
                         st.markdown(f"<span class='status-pill-violet'>Abre {win['release_date'].strftime('%d/%m/%Y')}</span>", unsafe_allow_html=True)
                     else:
                         st.markdown("<span class='status-pill-slate'>Expirada</span>", unsafe_allow_html=True)
                 with sc3:
-                    if st.button("✕", key=f"del_staged_{s_idx}", help="Quitar esta combinación"):
+                    if st.button("✕", key=f"del_staged_{s_idx}", help="Quitar"):
                         staged_slots.pop(s_idx)
                         st.rerun()
 
             st.markdown("")
             if st.button(
-                f"Guardar estas {len(staged_slots)} Fecha(s) en '{target_dest['name']}'",
+                f"Guardar {len(staged_slots)} fecha(s) en {target_dest['name']}",
                 key="save_staged_slots_btn",
                 type="primary",
                 width="stretch",
@@ -1304,30 +1390,27 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                         replace_existing=replace_mode,
                     )
                     st.session_state["staged_slots_list"] = []
-                    st.success(f"Se guardaron {len(inserted)} combinaciones de fechas en **{target_dest['name']}**.")
+                    st.success(f"Se guardaron {len(inserted)} fecha(s) en **{target_dest['name']}**.")
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
 
     # --------------------------------------------------------------------------
-    # OPTION A: AUTOMATIC 10-DATE WINDOW GENERATOR
+    # AUTOMATIC 10-DATE WINDOW GENERATOR
     # --------------------------------------------------------------------------
     with opt_a_tab:
-        st.caption(
-            "Elige un período de viaje, duración de estancia y días de la semana preferidos "
-            "para generar hasta 10 combinaciones óptimas automáticamente."
-        )
+        st.caption("Genera hasta 10 combinaciones según rango, duración y días de salida.")
         default_start = today + datetime.timedelta(days=14)
         default_end = today + datetime.timedelta(days=60)
 
         a1, a2, a3, a4 = st.columns([1.2, 1.2, 1.4, 1])
         with a1:
-            win_start = st.date_input("Inicio de Ventana", value=default_start, key="opta_start")
+            win_start = st.date_input("Desde", value=default_start, key="opta_start")
         with a2:
-            win_end = st.date_input("Fin de Ventana", value=default_end, key="opta_end")
+            win_end = st.date_input("Hasta", value=default_end, key="opta_end")
         with a3:
             stay_range = st.slider(
-                "Duración del Viaje (días)",
+                "Duración (días)",
                 min_value=2,
                 max_value=30,
                 value=(7, 10),
@@ -1335,7 +1418,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
             )
         with a4:
             max_gen_slots = st.number_input(
-                "Máx. Fechas",
+                "Máx. fechas",
                 min_value=1,
                 max_value=MAX_SLOTS_PER_DESTINATION,
                 value=MAX_SLOTS_PER_DESTINATION,
@@ -1353,7 +1436,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
             (6, "Dom"),
         ]
         selected_weekdays = st.multiselect(
-            "Días de Salida Preferidos",
+            "Días de salida",
             options=[w[0] for w in weekday_names],
             default=[3, 4, 5],
             format_func=lambda idx: dict(weekday_names)[idx],
@@ -1377,7 +1460,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
         )
 
         if generated_preview:
-            st.markdown(f"**Vista Previa ({len(generated_preview)} combinaciones generadas):**")
+            st.markdown(f"**Vista previa ({len(generated_preview)})**")
             preview_display = []
             for g in generated_preview:
                 w_info = get_flight_window_status(g["outbound_date"], g.get("return_date"))
@@ -1385,8 +1468,8 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     "Etiqueta": g["label"],
                     "Ida": g["outbound_date"],
                     "Vuelta": g.get("return_date") or "—",
-                    "Ventana (330d)": w_info["badge"],
-                    "Google Flights URL": g["google_flights_url"],
+                    "Ventana": w_info["badge"],
+                    "Google Flights": g["google_flights_url"],
                 })
             st.dataframe(
                 pd.DataFrame(preview_display),
@@ -1394,7 +1477,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                 hide_index=True,
             )
             if st.button(
-                f"Guardar estas {len(generated_preview)} Fechas en '{target_dest['name']}'",
+                f"Guardar {len(generated_preview)} fecha(s) en {target_dest['name']}",
                 key="save_opta_btn",
                 type="primary",
                 width="stretch",
@@ -1405,27 +1488,22 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                         slots=generated_preview,
                         replace_existing=replace_mode,
                     )
-                    st.success(
-                        f"Se guardaron {len(inserted)} combinaciones de fechas para **{target_dest['name']}**."
-                    )
+                    st.success(f"Se guardaron {len(inserted)} fecha(s) en **{target_dest['name']}**.")
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
         else:
-            st.warning("No se encontraron combinaciones para los días seleccionados en ese rango.")
+            st.warning("No se encontraron combinaciones para esos días.")
 
     # --------------------------------------------------------------------------
-    # OPTION C: PASTE GOOGLE FLIGHTS URLS (ROBUST REGEX EXTRACTION)
+    # PASTE GOOGLE FLIGHTS URLS
     # --------------------------------------------------------------------------
     with opt_c_tab:
-        st.caption(
-            "Pega de 1 a 10 URLs directamente desde Google Flights. "
-            "El sistema extrae el Protobuf `?tfs=`, limpia enlaces en formato markdown o notas, y normaliza moneda y lenguaje."
-        )
+        st.caption("Pega de 1 a 10 enlaces de Google Flights (uno por línea).")
         raw_urls_input = st.text_area(
-            "Pegar URLs de Google Flights (1 a 10 líneas)",
-            height=160,
-            placeholder="https://www.google.com/travel/flights/search?tfs=CBwQAhooEgoyMDI2LTExLTA2...\nhttps://www.google.com/travel/flights/search?tfs=CBwQAhooEgoyMDI2LTExLTEz...",
+            "Enlaces de Google Flights",
+            height=150,
+            placeholder="https://www.google.com/travel/flights/search?tfs=...",
             key="optc_textarea",
         )
 
@@ -1441,11 +1519,11 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     max_slots=MAX_SLOTS_PER_DESTINATION,
                 )
             except Exception as parse_err:
-                st.error(f"Error al analizar las URLs pegadas: {parse_err}")
+                st.error(f"Error al leer los enlaces: {parse_err}")
                 parsed_url_slots = []
 
             if parsed_url_slots:
-                st.markdown(f"**URLs Decodificadas ({len(parsed_url_slots)}):**")
+                st.markdown(f"**Fechas detectadas ({len(parsed_url_slots)})**")
                 display_pasted = []
                 for p in parsed_url_slots:
                     w_info = get_flight_window_status(p["outbound_date"], p.get("return_date"))
@@ -1453,8 +1531,8 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                         "Etiqueta": p["label"],
                         "Ida": p["outbound_date"],
                         "Vuelta": p.get("return_date") or "—",
-                        "Ventana (330d)": w_info["badge"],
-                        "Google Flights URL": p["google_flights_url"],
+                        "Ventana": w_info["badge"],
+                        "Google Flights": p["google_flights_url"],
                     })
                 st.dataframe(
                     pd.DataFrame(display_pasted),
@@ -1462,7 +1540,7 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                     hide_index=True,
                 )
                 if st.button(
-                    f"Guardar {len(parsed_url_slots)} URL(s) en '{target_dest['name']}'",
+                    f"Guardar {len(parsed_url_slots)} enlace(s) en {target_dest['name']}",
                     key="save_optc_btn",
                     type="primary",
                     width="stretch",
@@ -1473,12 +1551,12 @@ def render_tab2_destination_and_generator(destinations: list[dict[str, Any]]) ->
                             slots=parsed_url_slots,
                             replace_existing=replace_mode,
                         )
-                        st.success(f"Se guardaron {len(inserted)} URLs en **{target_dest['name']}**.")
+                        st.success(f"Se guardaron {len(inserted)} enlace(s) en **{target_dest['name']}**.")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
             else:
-                st.warning("No se detectaron URLs válidas de Google Flights en el texto ingresado.")
+                st.warning("No se detectaron enlaces válidos de Google Flights.")
 
 
 # ==============================================================================
@@ -1765,7 +1843,7 @@ def main() -> None:
     tab1, tab2, tab3 = st.tabs(
         [
             "Tab 1 — Explorador del Corredor y Matriz de Precios",
-            "Tab 2 — Crear / Gestionar Destino y Generador de Fechas",
+            "Tab 2 — Destinos y Fechas",
             "Tab 3 — Escáner en Vivo, Métricas y Probador de Telegram",
         ]
     )
