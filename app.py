@@ -68,7 +68,7 @@ from src.tfs_builder import (
 )
 
 st.set_page_config(
-    page_title="FlightPulse Matrix v4.0 | 10×10 Stealth Flight Tracker",
+    page_title=f"FlightPulse Matrix v4.0 | {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Stealth Flight Tracker",
     page_icon="✈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -248,7 +248,9 @@ def check_password_gate() -> bool:
     with col_center:
         st.markdown("")
         st.markdown("## FlightPulse Matrix v4.0")
-        st.caption("Self-Hosted 10×10 Google Flights Dual-Tab Stealth Engine (`Best` vs. `Cheapest`)")
+        st.caption(
+            f"Self-Hosted {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Google Flights Dual-Tab Stealth Engine (`Best` vs. `Cheapest`)"
+        )
         with st.form("login_form", clear_on_submit=False):
             pwd_input = st.text_input(
                 "Contraseña de Acceso (`APP_PASSWORD`)",
@@ -1949,14 +1951,14 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("## FlightPulse v4.0")
-        st.caption("Matrix 10×10 Stealth Flight Engine")
+        st.caption(f"Matrix {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Stealth Flight Engine")
         st.markdown("---")
         st.markdown(
-            """
+            f"""
             **Capacidad y Estado del Sistema:**
-            - **Destinos Activos:** Hasta `10`
-            - **Fechas por Destino:** Hasta `10`
-            - **Capacidad Total:** `100` Date Slots
+            - **Destinos Activos:** Hasta `{MAX_DESTINATIONS}`
+            - **Fechas por Destino:** Hasta `{MAX_SLOTS_PER_DESTINATION}`
+            - **Capacidad Total:** `{MAX_TOTAL_SLOTS}` Date Slots
             - **Extracción Dual:** `Más baratos` vs `Mejores`
             - **Ventana Oficial:** `330 días` máx. anticipación
             - **Anti-Ban Queue:** Sharded en lotes cada 25m

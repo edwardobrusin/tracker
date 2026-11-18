@@ -5,6 +5,7 @@ Semantic ARIA/DOM Flight Offer Parser for FlightPulse Matrix v4.0.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -212,12 +213,63 @@ def _looks_like_location_or_airport(text: str) -> bool:
     return False
 
 
-def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optional[FlightOffer]:
+def _extract_token_currency(entry: list[Any]) -> Optional[str]:
+    """
+    Decode the Google Flights booking token at `entry[1][1]` and extract the
+    embedded 3-letter ISO currency code (e.g. 'MXN', 'USD', 'EUR') if present.
+    """
+    token = _safe_get(entry, 1, 1)
+    if not isinstance(token, str) or len(token) < 8:
+        return None
+    try:
+        normalized = token.replace("-", "+").replace("_", "/")
+        padded = normalized + ("=" * ((4 - len(normalized) % 4) % 4))
+        raw = base64.b64decode(padded)
+        match = re.search(rb"\x1a\x03([A-Z]{3})", raw)
+        if match:
+            return match.group(1).decode("ascii")
+    except Exception:
+        return None
+    return None
+
+
+def extract_ds1_currency_from_html(html: str) -> Optional[str]:
+    """Return the first detected booking-token currency from an SSR HTML `ds:1` payload."""
+    ds1_array = extract_ds1_json_from_html(html)
+    if not ds1_array:
+        return None
+    for idx in (2, 3):
+        bucket = _safe_get(ds1_array, idx, 0)
+        if isinstance(bucket, list):
+            for entry in bucket:
+                if isinstance(entry, list):
+                    curr = _extract_token_currency(entry)
+                    if curr:
+                        return curr
+    return None
+
+
+def _parse_single_itinerary_entry(
+    entry: Any,
+    tab_source: str = "best",
+    expected_currency: Optional[str] = None,
+) -> Optional[FlightOffer]:
     """
     Parse a single Google Flights itinerary array entry into a `FlightOffer`.
+    Rejects entries whose embedded booking token currency mismatches `expected_currency`.
     """
     if not isinstance(entry, list) or len(entry) < 2:
         return None
+
+    if expected_currency:
+        token_curr = _extract_token_currency(entry)
+        if token_curr and token_curr != expected_currency.strip().upper():
+            logger.warning(
+                "Skipping ds:1 offer with currency mismatch: got %s, expected %s",
+                token_curr,
+                expected_currency,
+            )
+            return None
 
     price = _extract_price_from_itinerary_node(entry)
     if price is None or price <= 0:
@@ -303,7 +355,11 @@ def _parse_single_itinerary_entry(entry: Any, tab_source: str = "best") -> Optio
     )
 
 
-def parse_ds1_data_array(data: list[Any], default_tab: str = "best") -> list[FlightOffer]:
+def parse_ds1_data_array(
+    data: list[Any],
+    default_tab: str = "best",
+    expected_currency: Optional[str] = None,
+) -> list[FlightOffer]:
     """
     Extract all FlightOffer items from a parsed `ds:1` or `GetShoppingResults` JSON array.
     Checks standard Google Flights indices (`data[2][0]` for Best flights and `data[3][0]`
@@ -315,7 +371,9 @@ def parse_ds1_data_array(data: list[Any], default_tab: str = "best") -> list[Fli
     best_bucket = _safe_get(data, 2, 0)
     if isinstance(best_bucket, list):
         for item in best_bucket:
-            offer = _parse_single_itinerary_entry(item, tab_source="best")
+            offer = _parse_single_itinerary_entry(
+                item, tab_source="best", expected_currency=expected_currency
+            )
             if offer:
                 offers.append(offer)
 
@@ -323,7 +381,9 @@ def parse_ds1_data_array(data: list[Any], default_tab: str = "best") -> list[Fli
     other_bucket = _safe_get(data, 3, 0)
     if isinstance(other_bucket, list):
         for item in other_bucket:
-            offer = _parse_single_itinerary_entry(item, tab_source="cheapest")
+            offer = _parse_single_itinerary_entry(
+                item, tab_source="cheapest", expected_currency=expected_currency
+            )
             if offer:
                 offers.append(offer)
 
@@ -332,7 +392,9 @@ def parse_ds1_data_array(data: list[Any], default_tab: str = "best") -> list[Fli
         def _walk(node: Any, depth: int = 0) -> None:
             if depth > 7 or not isinstance(node, list):
                 return
-            offer = _parse_single_itinerary_entry(node, tab_source=default_tab)
+            offer = _parse_single_itinerary_entry(
+                node, tab_source=default_tab, expected_currency=expected_currency
+            )
             if offer and offer.airline != "Aerolínea":
                 offers.append(offer)
                 return
@@ -345,7 +407,10 @@ def parse_ds1_data_array(data: list[Any], default_tab: str = "best") -> list[Fli
     return offers
 
 
-def parse_ds1_from_html(html: str) -> Optional[DualTabExtraction]:
+def parse_ds1_from_html(
+    html: str,
+    expected_currency: Optional[str] = None,
+) -> Optional[DualTabExtraction]:
     """
     Parse Google Flights SSR HTML `AF_initDataCallback({key: 'ds:1'})` payload
     into a `DualTabExtraction` containing both the Best Tab offer and the Cheapest offer.
@@ -354,7 +419,7 @@ def parse_ds1_from_html(html: str) -> Optional[DualTabExtraction]:
     if not ds1_array:
         return None
 
-    offers = parse_ds1_data_array(ds1_array)
+    offers = parse_ds1_data_array(ds1_array, expected_currency=expected_currency)
     if not offers:
         return None
 
@@ -372,7 +437,10 @@ def parse_ds1_from_html(html: str) -> Optional[DualTabExtraction]:
     )
 
 
-def parse_shopping_rpc_response(raw_body: str) -> list[FlightOffer]:
+def parse_shopping_rpc_response(
+    raw_body: str,
+    expected_currency: Optional[str] = None,
+) -> list[FlightOffer]:
     """
     Parse a `FlightsFrontendService/GetShoppingResults` XHR response body captured
     via `page.on("response", ...)` when clicking the "Cheapest" (`Más baratos`) tab.
@@ -405,7 +473,13 @@ def parse_shopping_rpc_response(raw_body: str) -> list[FlightOffer]:
                     try:
                         inner_data = json.loads(inner_json_str)
                         if isinstance(inner_data, list):
-                            offers.extend(parse_ds1_data_array(inner_data, default_tab="cheapest"))
+                            offers.extend(
+                                parse_ds1_data_array(
+                                    inner_data,
+                                    default_tab="cheapest",
+                                    expected_currency=expected_currency,
+                                )
+                            )
                     except json.JSONDecodeError:
                         continue
 
@@ -577,6 +651,7 @@ def parse_flight_card_text(
     inner_text: str,
     price_override: Optional[float] = None,
     tab_source: str = "best",
+    expected_currency: Optional[str] = None,
 ) -> Optional[FlightOffer]:
     """
     Parse a Google Flights DOM flight card (`li.pIav2d` or `[role="listitem"]`)
@@ -585,6 +660,16 @@ def parse_flight_card_text(
     combined = f"{aria_label or ''} | {inner_text or ''}".strip()
     if not combined or combined == "|":
         return None
+
+    if expected_currency:
+        exp_curr = expected_currency.strip().upper()
+        for foreign_curr in ("MXN", "USD", "EUR", "CAD", "COP", "GBP"):
+            if foreign_curr != exp_curr and re.search(rf"\b{foreign_curr}\b", combined, re.IGNORECASE):
+                return None
+        if exp_curr != "USD" and re.search(r"US\$|dólares estadounidense", combined, re.IGNORECASE):
+            return None
+        if exp_curr != "EUR" and "€" in combined:
+            return None
 
     price = price_override or parse_price_number(aria_label) or parse_price_number(inner_text)
     if price is None or price <= 0:

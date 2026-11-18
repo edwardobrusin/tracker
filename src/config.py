@@ -67,11 +67,11 @@ TELEGRAM_BOT_TOKEN: str = _get_setting("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = _get_setting("TELEGRAM_CHAT_ID", "")
 APP_PASSWORD: str = _get_setting("APP_PASSWORD", "flightpulse-matrix-2026")
 
-# Matrix 10x10 Capacity Limits & Sharded Dispatcher Settings
-MAX_DESTINATIONS: int = int(_get_setting("MAX_DESTINATIONS", "10"))
+# Matrix 20x10 Capacity Limits & Sharded Dispatcher Settings
+MAX_DESTINATIONS: int = int(_get_setting("MAX_DESTINATIONS", "20"))
 MAX_SLOTS_PER_DESTINATION: int = int(_get_setting("MAX_SLOTS_PER_DESTINATION", "10"))
 MAX_TOTAL_SLOTS: int = MAX_DESTINATIONS * MAX_SLOTS_PER_DESTINATION
-MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "20"))
+MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "40"))
 
 # Google Flights Schedule Advance Booking Window (airline industry 330-337 day release)
 GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS: int = int(_get_setting("GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS", "330"))

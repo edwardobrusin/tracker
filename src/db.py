@@ -882,8 +882,8 @@ def create_date_slot(
     is_active: bool = True,
 ) -> int:
     """
-    Create a single date_slot under a destination, enforcing the 10-slot per
-    destination and 100-total active slot capacity limits.
+    Create a single date_slot under a destination, enforcing the per-destination
+    and global MAX_TOTAL_SLOTS active slot capacity limits.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:

@@ -1,16 +1,16 @@
-name: FlightPulse Matrix v4.0 — Sharded 10x10 Flight Scanner
+name: FlightPulse Matrix v4.0 — Sharded 20x10 Flight Scanner
 
 on:
   schedule:
     # Runs every 25 minutes, processing a sharded batch of due date_slots
-    # so up to 100 date_slots cycle smoothly without triggering anti-bot bursts.
+    # so up to 200 date_slots cycle smoothly without triggering anti-bot bursts.
     - cron: '*/25 * * * *'
   workflow_dispatch:
     inputs:
       max_slots:
         description: 'Maximum due date_slots to scan in this batch'
         required: false
-        default: '25'
+        default: '40'
         type: string
       force_all:
         description: 'Ignore check_interval_minutes and force scan active slots'
@@ -79,7 +79,7 @@ jobs:
           PROXY_LIST: ${{ secrets.PROXY_LIST }}
           HEADLESS_MODE: 'false'
         run: |
-          MAX_SLOTS="${{ inputs.max_slots || '25' }}"
+          MAX_SLOTS="${{ inputs.max_slots || '40' }}"
           FORCE_FLAG=""
           if [ "${{ inputs.force_all }}" = "true" ]; then
             FORCE_FLAG="--force-all"

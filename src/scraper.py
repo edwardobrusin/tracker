@@ -36,6 +36,8 @@ from src.config import (
     BLOCKED_RESOURCE_TYPES,
     BLOCKED_TELEMETRY_DOMAINS,
     CHEAPEST_TAB_WAIT_MS,
+    DEFAULT_CURRENCY,
+    DEFAULT_HL,
     GOOGLE_CONSENT_COOKIES,
     GOOGLE_SOCS_COOKIE_VALUE,
     HEADLESS_MODE,
@@ -44,6 +46,7 @@ from src.config import (
 from src.ds1_parser import (
     FlightOffer,
     detect_self_transfer,
+    extract_ds1_currency_from_html,
     parse_ds1_from_html,
     parse_flight_card_text,
     parse_price_number,
@@ -307,7 +310,13 @@ class PooledPatchrightSession:
         except Exception as exc:
             logger.warning("Failed to reset cookies between destinations: %s", exc)
 
-    def _extract_dom_cards(self, page: Any, tab_source: str, max_cards: int = 5) -> list[FlightOffer]:
+    def _extract_dom_cards(
+        self,
+        page: Any,
+        tab_source: str,
+        max_cards: int = 5,
+        expected_currency: Optional[str] = None,
+    ) -> list[FlightOffer]:
         """
         Layer 2: Extract flight offers from visible Google Flights DOM cards using both
         `aria-label` semantic parsing and specific card price/airline/stops/duration selectors.
@@ -347,6 +356,7 @@ class PooledPatchrightSession:
                     inner_text=inner_text,
                     price_override=price_override,
                     tab_source=tab_source,
+                    expected_currency=expected_currency,
                 )
                 if offer and offer.price > 0:
                     # Deduplicate identical offers
@@ -383,6 +393,9 @@ class PooledPatchrightSession:
     def _scrape_slot_once(self, url: str) -> Optional[SlotScrapeResult]:
         """Run a single browser page navigation and dual-tab extraction on `self._context`."""
         expected_origins, expected_destinations = _extract_expected_corridor_iatas(url)
+        expected_curr = (
+            parse_qs(urlparse(url).query).get("curr", [DEFAULT_CURRENCY])[0] or DEFAULT_CURRENCY
+        ).strip().upper()
         page = self._context.new_page()
         rpc_cheapest_offers: list[FlightOffer] = []
 
@@ -391,7 +404,7 @@ class PooledPatchrightSession:
                 resp_url = response.url
                 if "FlightsFrontendService/GetShoppingResults" in resp_url and response.status == 200:
                     body = response.text()
-                    parsed_rpc = parse_shopping_rpc_response(body)
+                    parsed_rpc = parse_shopping_rpc_response(body, expected_currency=expected_curr)
                     if parsed_rpc:
                         rpc_cheapest_offers.extend(parsed_rpc)
             except Exception:
@@ -451,13 +464,15 @@ class PooledPatchrightSession:
             # LAYER 1A: Parse inline SSR `AF_initDataCallback({key: 'ds:1'})`
             # ------------------------------------------------------------------
             html_content = page.content()
-            ds1_extraction = parse_ds1_from_html(html_content)
+            ds1_extraction = parse_ds1_from_html(html_content, expected_currency=expected_curr)
 
             # ------------------------------------------------------------------
             # LAYER 2A: Extract initial "Best" (`Mejores`) Tab cards from DOM
             # ------------------------------------------------------------------
             best_dom_offers = _filter_offers_for_corridor(
-                self._extract_dom_cards(page, tab_source="best", max_cards=3),
+                self._extract_dom_cards(
+                    page, tab_source="best", max_cards=3, expected_currency=expected_curr
+                ),
                 expected_origins,
                 expected_destinations,
             )
@@ -490,7 +505,9 @@ class PooledPatchrightSession:
                 page.wait_for_timeout(CHEAPEST_TAB_WAIT_MS)
 
             cheapest_dom_offers = _filter_offers_for_corridor(
-                self._extract_dom_cards(page, tab_source="cheapest", max_cards=3),
+                self._extract_dom_cards(
+                    page, tab_source="cheapest", max_cards=3, expected_currency=expected_curr
+                ),
                 expected_origins,
                 expected_destinations,
             )
@@ -692,6 +709,54 @@ class PooledPatchrightSession:
 # ==============================================================================
 
 
+def _build_ssr_slot_result(
+    html: str,
+    url: str,
+    expected_curr: str,
+    extraction_source: str,
+) -> Optional[SlotScrapeResult]:
+    """Parse an SSR HTML payload with currency and corridor validation."""
+    extraction = parse_ds1_from_html(html, expected_currency=expected_curr)
+    if not extraction:
+        return None
+
+    expected_origins, expected_destinations = _extract_expected_corridor_iatas(url)
+    filtered_top = _filter_offers_for_corridor(
+        [extraction.cheapest_offer, *extraction.top_offers],
+        expected_origins,
+        expected_destinations,
+    )
+    if not filtered_top:
+        return None
+    filtered_top.sort(key=lambda o: o.price)
+    cheapest = filtered_top[0]
+    best_filtered = (
+        _filter_offers_for_corridor([extraction.best_offer], expected_origins, expected_destinations)
+        if extraction.best_offer
+        else []
+    )
+    best = best_filtered[0] if best_filtered else cheapest
+
+    return SlotScrapeResult(
+        cheapest_tab_price=cheapest.price,
+        cheapest_airline=cheapest.airline,
+        cheapest_stops=cheapest.stops,
+        cheapest_duration=cheapest.duration,
+        cheapest_dep_arr=cheapest.dep_arr,
+        is_self_transfer=cheapest.is_self_transfer,
+        origin_airport=cheapest.origin_airport,
+        destination_airport=cheapest.destination_airport,
+        best_tab_price=best.price,
+        best_airline=best.airline,
+        best_stops=best.stops,
+        best_duration=best.duration,
+        best_origin_airport=best.origin_airport or cheapest.origin_airport,
+        best_destination_airport=best.destination_airport or cheapest.destination_airport,
+        extraction_source=extraction_source,
+        raw_top_offers=[o.to_dict() for o in filtered_top[:3]],
+    )
+
+
 def scrape_via_curl_cffi_ssr(
     url: str,
     proxy_url: Optional[str] = None,
@@ -705,6 +770,9 @@ def scrape_via_curl_cffi_ssr(
         logger.warning("curl_cffi is not available; skipping Layer 3A SSR fallback.")
         return None
 
+    expected_curr = (
+        parse_qs(urlparse(url).query).get("curr", [DEFAULT_CURRENCY])[0] or DEFAULT_CURRENCY
+    ).strip().upper()
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -730,64 +798,61 @@ def scrape_via_curl_cffi_ssr(
         if resp.status_code != 200 or not resp.text:
             return None
 
-        extraction = parse_ds1_from_html(resp.text)
-        if not extraction:
-            return None
-
-        expected_origins, expected_destinations = _extract_expected_corridor_iatas(url)
-        filtered_top = _filter_offers_for_corridor(
-            [extraction.cheapest_offer, *extraction.top_offers],
-            expected_origins,
-            expected_destinations,
-        )
-        if not filtered_top:
-            return None
-        filtered_top.sort(key=lambda o: o.price)
-        cheapest = filtered_top[0]
-        best_filtered = (
-            _filter_offers_for_corridor([extraction.best_offer], expected_origins, expected_destinations)
-            if extraction.best_offer
-            else []
-        )
-        best = best_filtered[0] if best_filtered else cheapest
-
-        return SlotScrapeResult(
-            cheapest_tab_price=cheapest.price,
-            cheapest_airline=cheapest.airline,
-            cheapest_stops=cheapest.stops,
-            cheapest_duration=cheapest.duration,
-            cheapest_dep_arr=cheapest.dep_arr,
-            is_self_transfer=cheapest.is_self_transfer,
-            origin_airport=cheapest.origin_airport,
-            destination_airport=cheapest.destination_airport,
-            best_tab_price=best.price,
-            best_airline=best.airline,
-            best_stops=best.stops,
-            best_duration=best.duration,
-            best_origin_airport=best.origin_airport or cheapest.origin_airport,
-            best_destination_airport=best.destination_airport or cheapest.destination_airport,
-            extraction_source="curl_cffi_ssr",
-            raw_top_offers=[o.to_dict() for o in filtered_top[:3]],
+        return _build_ssr_slot_result(
+            resp.text, url=url, expected_curr=expected_curr, extraction_source="curl_cffi_ssr"
         )
     except Exception as exc:
         logger.warning("Layer 3A (curl_cffi SSR) failed for %s: %s", url[:80], exc)
         return None
 
 
-def scrape_via_fast_flights_fallback(url: str) -> Optional[SlotScrapeResult]:
+def scrape_via_fast_flights_fallback(
+    url: str,
+    proxy_url: Optional[str] = None,
+) -> Optional[SlotScrapeResult]:
     """
-    Layer 3B: Secondary HTTP fallback using `fast-flights` if `tfs` parameters can be decoded.
-    Uses primary airport pair if N:M list is decoded.
+    Layer 3B: Secondary HTTP fallback using `primp` (full N:M URL + locale cookies) and
+    `fast-flights` with explicit `currency` and `language` plus ds:1 currency token verification.
     """
     try:
-        from fast_flights import FlightQuery, Passengers, create_filter, get_flights
-
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         tfs_b64 = qs.get("tfs", [""])[0]
-        curr = qs.get("curr", ["MXN"])[0]
+        curr = (qs.get("curr", [DEFAULT_CURRENCY])[0] or DEFAULT_CURRENCY).strip().upper()
+        hl = (qs.get("hl", [DEFAULT_HL])[0] or DEFAULT_HL).strip().lower()
         if not tfs_b64:
             return None
+
+        # 1. Preferred Tier 3B: fetch the exact N:M URL via `primp` (chrome_145 TLS) with SOCS cookie
+        try:
+            from primp import Client
+
+            client = Client(
+                impersonate="chrome_145",
+                impersonate_os="macos",
+                referer=True,
+                proxy=proxy_url,
+                cookie_store=True,
+            )
+            client.set_cookies(
+                "https://www.google.com",
+                [f"SOCS={GOOGLE_SOCS_COOKIE_VALUE}", "CONSENT=YES+cb.20240514-07-p0.es+FX+999"],
+            )
+            primp_resp = client.get(url)
+            if getattr(primp_resp, "status_code", 0) == 200 and getattr(primp_resp, "text", ""):
+                primp_ssr = _build_ssr_slot_result(
+                    primp_resp.text,
+                    url=url,
+                    expected_curr=curr,
+                    extraction_source=f"fast_flights_{curr.lower()}",
+                )
+                if primp_ssr and primp_ssr.cheapest_tab_price > 0:
+                    return primp_ssr
+        except Exception as primp_exc:
+            logger.debug("Tier 3B primp full-URL SSR fetch skipped: %s", primp_exc)
+
+        # 2. Secondary Tier 3B: `fast-flights` query WITH explicit currency & language + token verification
+        from fast_flights import FlightQuery, Passengers, create_filter, fetch_flights_html, parse as ff_parse
 
         decoded = decode_tfs_parameter(tfs_b64)
         origins_list = decoded.get("origins") or []
@@ -801,16 +866,27 @@ def scrape_via_fast_flights_fallback(url: str) -> Optional[SlotScrapeResult]:
         outbound_date = decoded.get("outbound_date")
         return_date = decoded.get("return_date")
         trip_type = decoded.get("trip_type", "round-trip")
+        max_stops = decoded.get("max_stops")
 
         if not (origin and destination and outbound_date):
             return None
 
         flights_list = [
-            FlightQuery(date=outbound_date, from_airport=origin, to_airport=destination)
+            FlightQuery(
+                date=outbound_date,
+                from_airport=origin,
+                to_airport=destination,
+                max_stops=max_stops,
+            )
         ]
         if trip_type == "round-trip" and return_date:
             flights_list.append(
-                FlightQuery(date=return_date, from_airport=destination, to_airport=origin)
+                FlightQuery(
+                    date=return_date,
+                    from_airport=destination,
+                    to_airport=origin,
+                    max_stops=max_stops,
+                )
             )
 
         q = create_filter(
@@ -818,8 +894,33 @@ def scrape_via_fast_flights_fallback(url: str) -> Optional[SlotScrapeResult]:
             trip="round-trip" if (trip_type == "round-trip" and return_date) else "one-way",
             seat="economy",
             passengers=Passengers(adults=1),
+            currency=curr,
+            language=hl,
         )
-        res = get_flights(q)
+        html = fetch_flights_html(q, proxy=proxy_url)
+        if not html:
+            return None
+
+        # Verify currency embedded in ds:1 booking token before accepting any price
+        detected_curr = extract_ds1_currency_from_html(html)
+        if detected_curr and detected_curr != curr:
+            logger.warning(
+                "Layer 3B (fast-flights) currency mismatch rejected: got %s, expected %s",
+                detected_curr,
+                curr,
+            )
+            return None
+
+        ds1_res = _build_ssr_slot_result(
+            html, url=url, expected_curr=curr, extraction_source=f"fast_flights_{curr.lower()}"
+        )
+        if ds1_res and ds1_res.cheapest_tab_price > 0:
+            return ds1_res
+
+        if detected_curr != curr:
+            return None
+
+        res = ff_parse(html)
         if not res:
             return None
 
@@ -861,6 +962,8 @@ def scrape_via_fast_flights_fallback(url: str) -> Optional[SlotScrapeResult]:
                     stops=stops_str,
                     duration=duration_str,
                     dep_arr=dep_arr[:50],
+                    origin_airport=origin,
+                    destination_airport=destination,
                     is_self_transfer=detect_self_transfer(f"{airline_name} {stops_str}"),
                     tab_source="best" if idx == 0 else "cheapest",
                 )
@@ -980,8 +1083,10 @@ def scrape_date_slot(
         )
         return ssr_result
 
-    # Tier 3B: fast-flights fallback
-    ff_result = scrape_via_fast_flights_fallback(url)
+    # Tier 3B: fast-flights / primp fallback (with proxy, then direct fallback)
+    ff_result = scrape_via_fast_flights_fallback(url, proxy_url=proxy_url)
+    if ff_result is None and proxy_url is not None:
+        ff_result = scrape_via_fast_flights_fallback(url, proxy_url=None)
     if ff_result and ff_result.cheapest_tab_price > 0:
         return ff_result
 

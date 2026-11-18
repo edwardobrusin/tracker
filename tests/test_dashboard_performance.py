@@ -25,7 +25,13 @@ if str(ROOT_DIR) not in sys.path:
 
 from streamlit.testing.v1 import AppTest
 
-from src.config import get_flight_window_status, get_proxy_pool
+from src.config import (
+    MAX_DESTINATIONS,
+    MAX_SLOTS_PER_RUN,
+    MAX_TOTAL_SLOTS,
+    get_flight_window_status,
+    get_proxy_pool,
+)
 from src.db import (
     bulk_create_date_slots,
     clear_db_cache,
@@ -44,6 +50,7 @@ from src.db import (
     update_destination,
 )
 from src.ds1_parser import (
+    _extract_token_currency,
     _parse_single_itinerary_entry,
     parse_flight_card_text,
     parse_price_number,
@@ -406,7 +413,34 @@ def bench_10_scraper_parser_and_db_integrity() -> None:
         fake_meta_node = [["Aeropuerto Internacional Felipe Ángeles, MX", ["Aeropuerto"]], [None, 985]]
         assert _parse_single_itinerary_entry(fake_meta_node) is None
 
-        # 5. Verify DB contains 0 corrupted 1839 rows
+        # 5. Reject currency mismatch (e.g. $307 USD when tracking MXN)
+        usd_card = (
+            "8:40\n\xa0–\xa0\n6:30+1\nAvianca\n6\xa0h 55\xa0min\nMEX–SJO\n"
+            "1 escala\nSAL\n500 kg CO2e\n307\xa0USD\nida y vuelta"
+        )
+        assert parse_flight_card_text("", usd_card, expected_currency="MXN") is None, "USD card must be rejected for MXN slot"
+        usd_token = base64.b64encode(b"\x08\x01\x1a\x03USD").decode("ascii")
+        mxn_token = base64.b64encode(b"\x08\x01\x1a\x03MXN").decode("ascii")
+        mock_leg = [None, None, None, "MEX", None, "2027-09-03", "SJO", None, None, 415]
+        mock_usd_entry = [
+            ["AV", ["Avianca"], [mock_leg], None, None, None, None, None, None, 415],
+            [[None, 307], usd_token],
+        ]
+        mock_mxn_entry = [
+            ["AV", ["Avianca"], [mock_leg], None, None, None, None, None, None, 415],
+            [[None, 5673], mxn_token],
+        ]
+        assert _extract_token_currency(mock_usd_entry) == "USD"
+        assert _parse_single_itinerary_entry(mock_usd_entry, expected_currency="MXN") is None
+        parsed_mxn = _parse_single_itinerary_entry(mock_mxn_entry, expected_currency="MXN")
+        assert parsed_mxn is not None and parsed_mxn.price == 5673.0
+
+        # 6. Verify 20x10 capacity expansion defaults
+        assert MAX_DESTINATIONS == 20, f"Expected MAX_DESTINATIONS=20, got {MAX_DESTINATIONS}"
+        assert MAX_TOTAL_SLOTS == 200, f"Expected MAX_TOTAL_SLOTS=200, got {MAX_TOTAL_SLOTS}"
+        assert MAX_SLOTS_PER_RUN >= 40, f"Expected MAX_SLOTS_PER_RUN>=40, got {MAX_SLOTS_PER_RUN}"
+
+        # 7. Verify DB contains 0 corrupted 1839 or 307 rows
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -419,8 +453,18 @@ def bench_10_scraper_parser_and_db_integrity() -> None:
                     "SELECT COUNT(*) AS c FROM date_slots WHERE latest_cheapest_price = 1839 OR all_time_low_price = 1839;"
                 )
                 assert cur.fetchone()["c"] == 0, "Corrupted 1839 date_slots still present"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM price_snapshots WHERE cheapest_tab_price = 307 OR best_tab_price = 307;"
+                )
+                assert cur.fetchone()["c"] == 0, "Corrupted 307 price_snapshots still present"
+                cur.execute("SELECT COUNT(*) AS c FROM alert_logs WHERE cheapest_price = 307 OR best_price = 307;")
+                assert cur.fetchone()["c"] == 0, "Corrupted 307 alert_logs still present"
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM date_slots WHERE latest_cheapest_price = 307 OR all_time_low_price = 307;"
+                )
+                assert cur.fetchone()["c"] == 0, "Corrupted 307 date_slots still present"
 
-        return "tfs_fields + promo/year/ds1_reject + 0 corrupted DB rows OK"
+        return "tfs_fields + currency_guard + 20x10_limits + 0 corrupted DB rows OK"
 
     measure("10. scraper_parser_db_integrity", _regressions)
 
