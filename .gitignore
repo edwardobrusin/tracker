@@ -31,3 +31,4 @@ desktop.ini
 # Logs & temporary files
 *.log
 scratch/
+tmp/

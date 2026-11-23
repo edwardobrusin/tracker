@@ -42,6 +42,8 @@ from src.config import (
     GOOGLE_SOCS_COOKIE_VALUE,
     HEADLESS_MODE,
     NAVIGATION_TIMEOUT_MS,
+    redact_proxy_for_log,
+    sanitize_log_text,
 )
 from src.ds1_parser import (
     FlightOffer,
@@ -76,6 +78,8 @@ class SlotScrapeResult:
     best_origin_airport: Optional[str] = None
     best_destination_airport: Optional[str] = None
     extraction_source: str = "patchright_dom"
+    cheapest_tab_status: str = "not_checked"
+    cheapest_source: str = "cheapest_dom"
     raw_top_offers: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +109,79 @@ def format_playwright_proxy(proxy_url: Optional[str]) -> Optional[dict[str, str]
         return cfg
     except Exception:
         return {"server": proxy_url}
+
+
+def consolidate_slot_offers(
+    best_dom_offers: list[FlightOffer],
+    cheapest_dom_offers: list[FlightOffer],
+    rpc_offers: list[FlightOffer],
+    ds1_offers: list[FlightOffer],
+    ds1_best: Optional[FlightOffer] = None,
+    expected_origins: Optional[set[str]] = None,
+    expected_destinations: Optional[set[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Consolidate Best and Cheapest offers across DOM, GetShoppingResults RPC, and initial ds:1.
+    Always selects `min(dom_cheapest, rpc_cheapest, ds1_cheapest)` and records which source won
+    (`cheapest_dom`, `cheapest_rpc`, `cheapest_ds1_min`).
+    """
+    best_offer: Optional[FlightOffer] = None
+    if best_dom_offers:
+        best_offer = best_dom_offers[0]
+    elif ds1_best:
+        best_offer = ds1_best
+
+    tagged_candidates: list[tuple[FlightOffer, str]] = []
+    for offer in cheapest_dom_offers:
+        tagged_candidates.append((offer, "cheapest_dom"))
+    for offer in rpc_offers:
+        tagged_candidates.append((offer, "cheapest_rpc"))
+    for offer in ds1_offers:
+        tagged_candidates.append((offer, "cheapest_ds1_min"))
+    for offer in best_dom_offers:
+        tagged_candidates.append((offer, "cheapest_dom"))
+
+    if not tagged_candidates:
+        return None
+
+    # Sort by price ASC; prefer DOM/RPC over ds1_min on exact tie
+    source_rank = {"cheapest_dom": 0, "cheapest_rpc": 1, "cheapest_ds1_min": 2}
+    tagged_candidates.sort(key=lambda pair: (pair[0].price, source_rank.get(pair[1], 3)))
+    cheapest_offer, cheapest_source = tagged_candidates[0]
+
+    if best_offer is None:
+        best_offer = cheapest_offer
+
+    if cheapest_source == "cheapest_dom" or best_dom_offers:
+        source_tag = "patchright_dom" if cheapest_source == "cheapest_dom" else (
+            "patchright_rpc" if cheapest_source == "cheapest_rpc" else "patchright_ds1"
+        )
+    elif cheapest_source == "cheapest_rpc":
+        source_tag = "patchright_rpc"
+    else:
+        source_tag = "patchright_ds1"
+
+    exp_o = expected_origins or set()
+    exp_d = expected_destinations or set()
+    fallback_orig = next(iter(exp_o)) if len(exp_o) == 1 else None
+    fallback_dest = next(iter(exp_d)) if len(exp_d) == 1 else None
+
+    c_orig = cheapest_offer.origin_airport or fallback_orig
+    c_dest = cheapest_offer.destination_airport or fallback_dest
+    b_orig = (best_offer.origin_airport if best_offer else None) or c_orig
+    b_dest = (best_offer.destination_airport if best_offer else None) or c_dest
+
+    return {
+        "cheapest_offer": cheapest_offer,
+        "best_offer": best_offer,
+        "cheapest_source": cheapest_source,
+        "extraction_source": source_tag,
+        "c_orig": c_orig,
+        "c_dest": c_dest,
+        "b_orig": b_orig,
+        "b_dest": b_dest,
+        "top_3_dicts": [pair[0].to_dict() for pair in tagged_candidates[:3]],
+    }
 
 
 def _extract_expected_corridor_iatas(url: str) -> tuple[set[str], set[str]]:
@@ -141,15 +218,34 @@ def _filter_offers_for_corridor(
     return filtered
 
 
+def _is_quota_or_auth_error(exc_or_msg: Any) -> bool:
+    """Return True if an exception/message indicates proxy HTTP 402/407 or quota/auth exhaustion."""
+    msg = str(exc_or_msg).upper()
+    markers = (
+        "402",
+        "407",
+        "ERR_PROXY_AUTH",
+        "PROXY_AUTH",
+        "PAYMENT REQUIRED",
+        "QUOTA",
+        "BANDWIDTH",
+        "CREDENCIALES DE PROXY RECHAZADAS",
+        "CUOTA DE PROXY AGOTADA",
+    )
+    return any(m in msg for m in markers)
+
+
 def _is_proxy_or_tunnel_error(exc: Exception) -> bool:
-    """Return True if an exception indicates a proxy/tunnel failure (e.g. FortiGate 403 or unreachable proxy)."""
+    """Return True if an exception indicates a proxy/tunnel failure (e.g. FortiGate 403, 402/407, or unreachable proxy)."""
     msg = str(exc).upper()
     markers = (
         "ERR_PROXY_CONNECTION_FAILED",
         "ERR_TUNNEL_CONNECTION_FAILED",
         "ERR_PROXY_AUTH",
         "ERR_PROXY_TUNNEL_BLOCKED",
+        "402",
         "403",
+        "407",
         "FORTIGATE",
         "PROXY",
     )
@@ -194,13 +290,13 @@ class PooledPatchrightSession:
             logger.info(
                 "Launched Patchright Chrome (channel='chrome', headless=%s, proxy=%s)",
                 self.headless,
-                self.proxy_url or "direct",
+                redact_proxy_for_log(self.proxy_url),
             )
         except Exception as exc:
             logger.warning(
                 "Chrome channel launch (headless=%s) failed (%s); trying fallback headless=True.",
                 self.headless,
-                exc,
+                sanitize_log_text(exc),
             )
             try:
                 self._browser = self._pw.chromium.launch(
@@ -212,7 +308,7 @@ class PooledPatchrightSession:
             except Exception as exc2:
                 logger.warning(
                     "Chrome channel unavailable (%s); falling back to bundled Patchright Chromium.",
-                    exc2,
+                    sanitize_log_text(exc2),
                 )
                 try:
                     self._browser = self._pw.chromium.launch(
@@ -254,7 +350,7 @@ class PooledPatchrightSession:
         """Close a failing proxy browser and re-open one reusable direct browser on this session."""
         logger.warning(
             "Proxy %s failed or was blocked; switching pooled browser session in-place to direct connection.",
-            self.proxy_url,
+            redact_proxy_for_log(self.proxy_url),
         )
         for resource in (self._context, self._browser):
             if resource is not None:
@@ -318,38 +414,41 @@ class PooledPatchrightSession:
         expected_currency: Optional[str] = None,
     ) -> list[FlightOffer]:
         """
-        Layer 2: Extract flight offers from visible Google Flights DOM cards using both
-        `aria-label` semantic parsing and specific card price/airline/stops/duration selectors.
+        Layer 2: Extract flight offers from visible Google Flights DOM cards in a single
+        atomic `page.evaluate(...)` call (avoids multi-second Playwright locator stalls).
         """
         offers: list[FlightOffer] = []
+        limit = max(1, max_cards * 2)
+        try:
+            raw_cards = page.evaluate(
+                """(maxItems) => {
+                    const cards = Array.from(document.querySelectorAll('li.pIav2d')).slice(0, maxItems);
+                    return cards.map(card => {
+                        let aria = card.getAttribute('aria-label') || '';
+                        if (!aria) {
+                            const innerLabeled = card.querySelector('[aria-label]');
+                            if (innerLabeled) aria = innerLabeled.getAttribute('aria-label') || '';
+                        }
+                        const innerText = card.innerText || '';
+                        const priceEl = card.querySelector('.YMlIz, span[data-gs]');
+                        const priceText = priceEl ? (priceEl.innerText || '') : '';
+                        return { aria, innerText, priceText };
+                    });
+                }""",
+                limit,
+            )
+        except Exception:
+            raw_cards = []
 
-        # Strictly query Google Flights itinerary list items (`li.pIav2d`) so landing-page
-        # promo cards and passenger selector rows (`div[role="listitem"]`) are never parsed.
-        card_locators = page.locator("li.pIav2d")
-        count = card_locators.count()
+        if not isinstance(raw_cards, list):
+            return offers
 
-        limit = min(count, max_cards * 2)
-        for idx in range(limit):
+        for item in raw_cards:
             try:
-                card = card_locators.nth(idx)
-                aria_label = ""
-                # Check aria-label on the card or its inner interactive link/div
-                raw_aria = card.get_attribute("aria-label")
-                if raw_aria:
-                    aria_label = raw_aria
-                else:
-                    inner_labeled = card.locator("[aria-label]").first
-                    if inner_labeled.count() > 0:
-                        aria_label = inner_labeled.get_attribute("aria-label") or ""
-
-                inner_text = card.inner_text(timeout=1200)
-
-                # Explicit price element check inside card (.YMlIz, [data-gs])
-                price_override: Optional[float] = None
-                price_el = card.locator(".YMlIz, span[data-gs]").first
-                if price_el.count() > 0:
-                    price_text = price_el.inner_text(timeout=800)
-                    price_override = parse_price_number(price_text)
+                aria_label = str(item.get("aria") or "")
+                inner_text = str(item.get("innerText") or "")
+                price_text = str(item.get("priceText") or "")
+                price_override = parse_price_number(price_text) if price_text else None
 
                 offer = parse_flight_card_text(
                     aria_label=aria_label,
@@ -359,7 +458,6 @@ class PooledPatchrightSession:
                     expected_currency=expected_currency,
                 )
                 if offer and offer.price > 0:
-                    # Deduplicate identical offers
                     if not any(
                         abs(o.price - offer.price) < 1.0
                         and o.airline == offer.airline
@@ -397,13 +495,17 @@ class PooledPatchrightSession:
             parse_qs(urlparse(url).query).get("curr", [DEFAULT_CURRENCY])[0] or DEFAULT_CURRENCY
         ).strip().upper()
         page = self._context.new_page()
+        page.set_default_timeout(15000)
         rpc_cheapest_offers: list[FlightOffer] = []
+        rpc_payload_counter = {"count": 0}
 
         def _on_response(response: Any) -> None:
             try:
                 resp_url = response.url
-                if "FlightsFrontendService/GetShoppingResults" in resp_url and response.status == 200:
+                if ("FlightsFrontendService/GetShoppingResults" in resp_url or "batchexecute" in resp_url) and response.status == 200:
                     body = response.text()
+                    if body and len(body) > 200:
+                        rpc_payload_counter["count"] += 1
                     parsed_rpc = parse_shopping_rpc_response(body, expected_currency=expected_curr)
                     if parsed_rpc:
                         rpc_cheapest_offers.extend(parsed_rpc)
@@ -471,42 +573,24 @@ class PooledPatchrightSession:
             # ------------------------------------------------------------------
             best_dom_offers = _filter_offers_for_corridor(
                 self._extract_dom_cards(
-                    page, tab_source="best", max_cards=3, expected_currency=expected_curr
+                    page, tab_source="best", max_cards=8, expected_currency=expected_curr
                 ),
                 expected_origins,
                 expected_destinations,
             )
 
             # ------------------------------------------------------------------
-            # LAYER 2B: Click "Cheapest" (`Más baratos` / `Cheapest`) Tab
+            # LAYER 2B: Deterministic Switch to Cheapest ("Los más bajos") Tab
             # ------------------------------------------------------------------
-            cheapest_tab_clicked = False
-            try:
-                cheapest_tab = page.get_by_role(
-                    "tab",
-                    name=re.compile(r"Cheapest|Más baratos|Baratos", re.I),
-                ).first
-                if cheapest_tab.count() > 0:
-                    cheapest_tab.click(timeout=4000)
-                    cheapest_tab_clicked = True
-                else:
-                    # Fallback locator for tab headers
-                    fallback_tab = page.locator(
-                        '[role="tab"]:has-text("Más baratos"), [role="tab"]:has-text("Cheapest")'
-                    ).first
-                    if fallback_tab.count() > 0:
-                        fallback_tab.click(timeout=4000)
-                        cheapest_tab_clicked = True
-            except Exception as click_exc:
-                logger.debug("Cheapest tab click skipped or unavailable: %s", click_exc)
-
-            if cheapest_tab_clicked:
-                # Wait 1,500ms for Google Flights list re-ordering / RPC hydration
-                page.wait_for_timeout(CHEAPEST_TAB_WAIT_MS)
+            cheapest_tab_clicked, cheapest_tab_status = self._switch_to_cheapest_tab_deterministic(
+                page=page,
+                rpc_payload_counter=rpc_payload_counter,
+                best_dom_offers=best_dom_offers,
+            )
 
             cheapest_dom_offers = _filter_offers_for_corridor(
                 self._extract_dom_cards(
-                    page, tab_source="cheapest", max_cards=3, expected_currency=expected_curr
+                    page, tab_source="cheapest", max_cards=8, expected_currency=expected_curr
                 ),
                 expected_origins,
                 expected_destinations,
@@ -528,50 +612,22 @@ class PooledPatchrightSession:
                     ds1_best = best_filtered[0] if best_filtered else None
 
             # ------------------------------------------------------------------
-            # MERGE & SELECT BEST + CHEAPEST OFFERS ACROSS LAYER 1 & LAYER 2
+            # MERGE & SELECT BEST + MIN(DOM, RPC, DS:1) CHEAPEST OFFERS
             # ------------------------------------------------------------------
-            best_offer: Optional[FlightOffer] = None
-            if best_dom_offers:
-                best_offer = best_dom_offers[0]
-            elif ds1_best:
-                best_offer = ds1_best
-
-            cheapest_candidates: list[FlightOffer] = []
-            if cheapest_dom_offers:
-                cheapest_candidates.extend(cheapest_dom_offers)
-            if filtered_rpc_offers:
-                cheapest_candidates.extend(filtered_rpc_offers)
-            if ds1_offers:
-                cheapest_candidates.extend(ds1_offers)
-            if best_dom_offers:
-                cheapest_candidates.extend(best_dom_offers)
-
-            if not cheapest_candidates:
+            consolidated = consolidate_slot_offers(
+                best_dom_offers=best_dom_offers,
+                cheapest_dom_offers=cheapest_dom_offers,
+                rpc_offers=filtered_rpc_offers,
+                ds1_offers=ds1_offers,
+                ds1_best=ds1_best,
+                expected_origins=expected_origins,
+                expected_destinations=expected_destinations,
+            )
+            if not consolidated:
                 return None
 
-            cheapest_candidates.sort(key=lambda o: o.price)
-            cheapest_offer = cheapest_candidates[0]
-
-            if best_offer is None:
-                best_offer = cheapest_offer
-
-            # Determine primary extraction_source tag for telemetry
-            if cheapest_dom_offers or best_dom_offers:
-                source_tag = "patchright_dom"
-            elif filtered_rpc_offers:
-                source_tag = "patchright_rpc"
-            else:
-                source_tag = "patchright_ds1"
-
-            top_3_dicts = [o.to_dict() for o in cheapest_candidates[:3]]
-
-            fallback_orig = next(iter(expected_origins)) if len(expected_origins) == 1 else None
-            fallback_dest = next(iter(expected_destinations)) if len(expected_destinations) == 1 else None
-
-            c_orig = cheapest_offer.origin_airport or fallback_orig
-            c_dest = cheapest_offer.destination_airport or fallback_dest
-            b_orig = (best_offer.origin_airport if best_offer else None) or c_orig
-            b_dest = (best_offer.destination_airport if best_offer else None) or c_dest
+            cheapest_offer = consolidated["cheapest_offer"]
+            best_offer = consolidated["best_offer"]
 
             return SlotScrapeResult(
                 cheapest_tab_price=cheapest_offer.price,
@@ -580,22 +636,218 @@ class PooledPatchrightSession:
                 cheapest_duration=cheapest_offer.duration,
                 cheapest_dep_arr=cheapest_offer.dep_arr,
                 is_self_transfer=cheapest_offer.is_self_transfer,
-                origin_airport=c_orig,
-                destination_airport=c_dest,
+                origin_airport=consolidated["c_orig"],
+                destination_airport=consolidated["c_dest"],
                 best_tab_price=best_offer.price if best_offer else cheapest_offer.price,
                 best_airline=best_offer.airline if best_offer else cheapest_offer.airline,
                 best_stops=best_offer.stops if best_offer else cheapest_offer.stops,
                 best_duration=best_offer.duration if best_offer else cheapest_offer.duration,
-                best_origin_airport=b_orig,
-                best_destination_airport=b_dest,
-                extraction_source=source_tag,
-                raw_top_offers=top_3_dicts,
+                best_origin_airport=consolidated["b_orig"],
+                best_destination_airport=consolidated["b_dest"],
+                extraction_source=consolidated["extraction_source"],
+                cheapest_tab_status=cheapest_tab_status,
+                cheapest_source=consolidated["cheapest_source"],
+                raw_top_offers=consolidated["top_3_dicts"],
             )
         finally:
             try:
                 page.close()
             except Exception:
                 pass
+
+    def _probe_cheapest_dom_state(self, page: Any) -> dict[str, Any]:
+        """
+        Atomically read tab selection, loading indicators, no-cheaper notice, and top 3
+        DOM card signatures in a single `page.evaluate(...)` call (avoids 30s locator timeouts).
+        """
+        try:
+            state = page.evaluate(
+                """() => {
+                    const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+                    const tabRe = /Los más bajos|Más bajos|Cheapest|Más baratos|Baratos/i;
+                    const cTab = tabs.find(t => tabRe.test(t.innerText || ''));
+                    const ariaSelected = cTab ? (cTab.getAttribute('aria-selected') === 'true') : false;
+                    const tabText = cTab ? (cTab.innerText || '').toLowerCase() : '';
+                    const tabLoading = tabText.includes('obteniendo resultados') || tabText.includes('getting results');
+
+                    const busyEls = document.querySelectorAll('[role="progressbar"], [aria-busy="true"]');
+                    let visibleBusy = 0;
+                    for (const el of busyEls) {
+                        if (el.offsetParent !== null || el.getClientRects().length > 0) visibleBusy++;
+                    }
+
+                    const bodyLower = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+                    const noCheaper = (
+                        bodyLower.includes('no hay opciones más baratas') ||
+                        bodyLower.includes('no hay vuelos más baratos') ||
+                        bodyLower.includes('no cheaper options') ||
+                        bodyLower.includes('no cheaper flights')
+                    );
+
+                    const cards = Array.from(document.querySelectorAll('li.pIav2d')).slice(0, 3);
+                    const topCards = cards.map(c => {
+                        const pEl = c.querySelector('.YMlIz, span[data-gs]');
+                        const price = pEl ? (pEl.innerText || '').trim() : '';
+                        const lines = (c.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean).slice(0, 4).join('|');
+                        return [price, lines];
+                    });
+
+                    return { ariaSelected, tabLoading, visibleBusy, noCheaper, topCards };
+                }"""
+            )
+            if isinstance(state, dict):
+                return state
+        except Exception:
+            pass
+        return {
+            "ariaSelected": False,
+            "tabLoading": False,
+            "visibleBusy": 0,
+            "noCheaper": False,
+            "topCards": [],
+        }
+
+    def _switch_to_cheapest_tab_deterministic(
+        self,
+        page: Any,
+        rpc_payload_counter: dict[str, int],
+        best_dom_offers: list[FlightOffer],
+        hard_timeout_s: float = 15.0,
+    ) -> tuple[bool, str]:
+        """
+        Deterministically switch from 'Mejores opciones' to 'Los más bajos' / 'Cheapest'
+        with a strict 15s hard deadline and dedicated click error tolerance:
+          1. Locate and click the tab inside a dedicated try/except (`cheapest_click_timeout` on failure).
+          2. Wait for RPC payload + atomic `page.evaluate(...)` loading checks to clear.
+          3. Wait for 2 consecutive identical DOM card snapshots (~600 ms apart) within hard_deadline.
+          4. Handle 'no cheaper options' / identical prices cleanly without aborting the slot.
+        """
+        t0 = time.perf_counter()
+        hard_deadline = t0 + hard_timeout_s
+        tab_pattern = re.compile(r"Los más bajos|Más bajos|Cheapest|Más baratos|Baratos", re.I)
+
+        try:
+            cheapest_tab = page.locator('[role="tab"]').filter(has_text=tab_pattern).first
+            if cheapest_tab.count() == 0:
+                cheapest_tab = page.get_by_role("tab", name=tab_pattern).first
+            if cheapest_tab.count() == 0:
+                logger.info("Cheapest tab transition: status=cheapest_tab_missing")
+                return False, "cheapest_tab_missing"
+        except Exception as find_exc:
+            logger.warning(
+                "Cheapest tab locate failed (%s); preserving Mejores/ds:1 offers.",
+                sanitize_log_text(find_exc),
+            )
+            return False, "cheapest_click_timeout"
+
+        rpc_before = rpc_payload_counter.get("count", 0)
+        net_state = {"req_count": 0, "resp_200_count": 0}
+
+        def _pre_req(req: Any) -> None:
+            try:
+                if "FlightsFrontendService/GetShoppingResults" in req.url or "batchexecute" in req.url:
+                    net_state["req_count"] += 1
+            except Exception:
+                pass
+
+        def _pre_resp(resp: Any) -> None:
+            try:
+                if ("FlightsFrontendService/GetShoppingResults" in resp.url or "batchexecute" in resp.url) and resp.status == 200:
+                    net_state["resp_200_count"] += 1
+            except Exception:
+                pass
+
+        page.on("request", _pre_req)
+        page.on("response", _pre_resp)
+        timed_out_loading = False
+        dom_state: dict[str, Any] = {}
+        try:
+            try:
+                cheapest_tab.click(timeout=5000)
+            except Exception as click_exc:
+                logger.warning(
+                    "Cheapest tab click failed (%s); preserving Mejores/ds:1 offers.",
+                    sanitize_log_text(click_exc),
+                )
+                return False, "cheapest_click_timeout"
+
+            # Atomic loading check loop bounded by hard_deadline (leaving >=3s for stabilization)
+            load_deadline = min(hard_deadline - 2.5, t0 + 10.5)
+            while time.perf_counter() < load_deadline:
+                dom_state = self._probe_cheapest_dom_state(page)
+                has_new_rpc_payload = rpc_payload_counter.get("count", 0) > rpc_before
+                rpc_in_flight = (
+                    net_state["req_count"] > 0
+                    and not has_new_rpc_payload
+                    and (time.perf_counter() - t0) < 9.0
+                )
+                if (
+                    dom_state.get("ariaSelected")
+                    and dom_state.get("visibleBusy", 0) == 0
+                    and not dom_state.get("tabLoading")
+                    and not rpc_in_flight
+                ):
+                    if has_new_rpc_payload or (time.perf_counter() - t0) >= 1.2:
+                        break
+                page.wait_for_timeout(250)
+            else:
+                timed_out_loading = True
+        finally:
+            try:
+                page.remove_listener("request", _pre_req)
+                page.remove_listener("response", _pre_resp)
+            except Exception:
+                pass
+
+        if not dom_state:
+            dom_state = self._probe_cheapest_dom_state(page)
+
+        no_cheaper_notice = bool(dom_state.get("noCheaper"))
+        prev_sig = tuple(tuple(c) for c in (dom_state.get("topCards") or []))
+        stabilized = False
+
+        # DOM stabilization loop strictly bounded by hard_deadline
+        while time.perf_counter() + 0.65 <= hard_deadline:
+            page.wait_for_timeout(600)
+            dom_state = self._probe_cheapest_dom_state(page)
+            if dom_state.get("noCheaper"):
+                no_cheaper_notice = True
+            curr_sig = tuple(tuple(c) for c in (dom_state.get("topCards") or []))
+            has_price = any(bool(c[0]) for c in curr_sig if len(c) >= 1)
+            if curr_sig and has_price and curr_sig == prev_sig:
+                stabilized = True
+                break
+            prev_sig = curr_sig
+
+        has_new_rpc_payload = rpc_payload_counter.get("count", 0) > rpc_before
+        elapsed = time.perf_counter() - t0
+
+        if no_cheaper_notice:
+            status_reason = "cheapest_no_cheaper_notice"
+        elif timed_out_loading and not stabilized and not has_new_rpc_payload:
+            status_reason = "cheapest_timeout"
+        elif has_new_rpc_payload and stabilized:
+            status_reason = "cheapest_loaded_rpc"
+        elif best_dom_offers and prev_sig:
+            top_parsed = parse_price_number(prev_sig[0][0]) if prev_sig[0] else None
+            if top_parsed is not None and abs(top_parsed - best_dom_offers[0].price) < 1.0:
+                status_reason = "cheapest_same_as_best"
+            elif has_new_rpc_payload:
+                status_reason = "cheapest_loaded_rpc"
+            else:
+                status_reason = "cheapest_dom_stabilized"
+        elif stabilized:
+            status_reason = "cheapest_dom_stabilized"
+        else:
+            status_reason = "cheapest_timeout"
+
+        logger.info(
+            "Cheapest tab transition: status=%s (%.2fs, rpc_payloads=%d)",
+            status_reason,
+            elapsed,
+            rpc_payload_counter.get("count", 0) - rpc_before,
+        )
+        return True, status_reason
 
     def scrape_slot_in_browser(self, url: str) -> Optional[SlotScrapeResult]:
         """
@@ -666,7 +918,7 @@ class PooledPatchrightSession:
                 res.extraction_source = "patchright_direct_fallback"
             return res
         except Exception as exc:
-            logger.warning("Direct browser fallback encountered error: %s", exc)
+            logger.warning("Direct browser fallback encountered error: %s", sanitize_log_text(exc))
             return None
         finally:
             if direct_context is not None:
@@ -802,7 +1054,7 @@ def scrape_via_curl_cffi_ssr(
             resp.text, url=url, expected_curr=expected_curr, extraction_source="curl_cffi_ssr"
         )
     except Exception as exc:
-        logger.warning("Layer 3A (curl_cffi SSR) failed for %s: %s", url[:80], exc)
+        logger.warning("Layer 3A (curl_cffi SSR) failed for %s: %s", url[:80], sanitize_log_text(exc))
         return None
 
 
@@ -849,7 +1101,7 @@ def scrape_via_fast_flights_fallback(
                 if primp_ssr and primp_ssr.cheapest_tab_price > 0:
                     return primp_ssr
         except Exception as primp_exc:
-            logger.debug("Tier 3B primp full-URL SSR fetch skipped: %s", primp_exc)
+            logger.debug("Tier 3B primp full-URL SSR fetch skipped: %s", sanitize_log_text(primp_exc))
 
         # 2. Secondary Tier 3B: `fast-flights` query WITH explicit currency & language + token verification
         from fast_flights import FlightQuery, Passengers, create_filter, fetch_flights_html, parse as ff_parse
@@ -994,7 +1246,7 @@ def scrape_via_fast_flights_fallback(
             raw_top_offers=[o.to_dict() for o in sorted(parsed_offers, key=lambda x: x.price)[:3]],
         )
     except Exception as exc:
-        logger.debug("Layer 3B (fast-flights) fallback failed: %s", exc)
+        logger.debug("Layer 3B (fast-flights) fallback failed: %s", sanitize_log_text(exc))
         return None
 
 
@@ -1014,23 +1266,36 @@ def scrape_date_slot(
     # Tier 1 & 2: Pooled Patchright Browser Execution
     session_to_use = pooled_session
     own_session = False
+    active_proxy: Optional[str] = session_to_use.proxy_url if session_to_use is not None else proxy_url
+    proxy_failed = False
+
     if session_to_use is None:
         try:
-            session_to_use = PooledPatchrightSession(proxy_url=proxy_url, headless=True).start()
+            session_to_use = PooledPatchrightSession(proxy_url=active_proxy, headless=True).start()
             own_session = True
+            active_proxy = session_to_use.proxy_url
         except Exception as init_exc:
-            logger.debug("Could not start standalone browser session: %s", init_exc)
+            logger.debug(
+                "Could not start standalone browser session on %s: %s",
+                redact_proxy_for_log(active_proxy),
+                sanitize_log_text(init_exc),
+            )
+            if active_proxy is not None and _is_proxy_or_tunnel_error(init_exc):
+                proxy_failed = True
+                active_proxy = None
             session_to_use = None
 
     if session_to_use is not None:
         try:
             try:
                 browser_result = session_to_use.scrape_slot_in_browser(url)
+                active_proxy = session_to_use.proxy_url
                 if browser_result and browser_result.cheapest_tab_price > 0:
                     elapsed = time.perf_counter() - start_ts
                     logger.info(
-                        "Scraped slot via %s in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
+                        "Scraped slot via %s (%s) in %.2fs -> Cheapest: $%.0f (%s) | Best: $%.0f",
                         browser_result.extraction_source,
+                        browser_result.cheapest_source,
                         elapsed,
                         browser_result.cheapest_tab_price,
                         browser_result.cheapest_airline,
@@ -1040,14 +1305,19 @@ def scrape_date_slot(
             except Exception as browser_exc:
                 logger.warning(
                     "Patchright browser extraction on %s encountered error (%s); trying direct fallback.",
-                    session_to_use.proxy_url or "direct",
-                    browser_exc,
+                    redact_proxy_for_log(session_to_use.proxy_url),
+                    sanitize_log_text(browser_exc),
                 )
+                if session_to_use.proxy_url is not None and _is_proxy_or_tunnel_error(browser_exc):
+                    proxy_failed = True
+                    active_proxy = None
 
             # Tier 2B: Switch pooled session in-place to direct if proxy yielded 0 results or failed
             if session_to_use.proxy_url is not None:
                 try:
                     session_to_use._switch_to_direct_in_place()
+                    active_proxy = None
+                    proxy_failed = True
                     direct_res = session_to_use._scrape_slot_once(url)
                     if direct_res and direct_res.cheapest_tab_price > 0:
                         direct_res.extraction_source = "patchright_direct_fallback"
@@ -1061,7 +1331,7 @@ def scrape_date_slot(
                         )
                         return direct_res
                 except Exception as direct_exc:
-                    logger.debug("Direct browser fallback error: %s", direct_exc)
+                    logger.debug("Direct browser fallback error: %s", sanitize_log_text(direct_exc))
         finally:
             if own_session and session_to_use is not None:
                 try:
@@ -1069,9 +1339,10 @@ def scrape_date_slot(
                 except Exception:
                     pass
 
-    # Tier 3A: curl_cffi TLS-impersonated SSR `ds:1` extraction (with proxy, then direct fallback)
-    ssr_result = scrape_via_curl_cffi_ssr(url, proxy_url=proxy_url)
-    if ssr_result is None and proxy_url is not None:
+    # Tier 3A: curl_cffi TLS-impersonated SSR `ds:1` extraction (respects active channel; never retries a failed proxy)
+    tier3_proxy = None if proxy_failed else active_proxy
+    ssr_result = scrape_via_curl_cffi_ssr(url, proxy_url=tier3_proxy)
+    if ssr_result is None and tier3_proxy is not None:
         ssr_result = scrape_via_curl_cffi_ssr(url, proxy_url=None)
     if ssr_result and ssr_result.cheapest_tab_price > 0:
         elapsed = time.perf_counter() - start_ts
@@ -1083,9 +1354,9 @@ def scrape_date_slot(
         )
         return ssr_result
 
-    # Tier 3B: fast-flights / primp fallback (with proxy, then direct fallback)
-    ff_result = scrape_via_fast_flights_fallback(url, proxy_url=proxy_url)
-    if ff_result is None and proxy_url is not None:
+    # Tier 3B: fast-flights / primp fallback (respects active channel; never retries a failed proxy)
+    ff_result = scrape_via_fast_flights_fallback(url, proxy_url=tier3_proxy)
+    if ff_result is None and tier3_proxy is not None:
         ff_result = scrape_via_fast_flights_fallback(url, proxy_url=None)
     if ff_result and ff_result.cheapest_tab_price > 0:
         return ff_result

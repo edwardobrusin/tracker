@@ -41,6 +41,7 @@ else:
 
 from src.config import (
     DATABASE_URL,
+    DEFAULT_CHECK_INTERVAL_MINUTES,
     DEFAULT_CURRENCY,
     DEFAULT_GL,
     DEFAULT_HL,
@@ -72,7 +73,7 @@ CREATE TABLE IF NOT EXISTS destinations (
     gl VARCHAR(10) DEFAULT 'MX',
     hl VARCHAR(10) DEFAULT 'es',
     target_price NUMERIC(12, 2) NOT NULL,
-    check_interval_minutes INTEGER DEFAULT 60,
+    check_interval_minutes INTEGER DEFAULT 240,
     cooldown_hours INTEGER DEFAULT 12,
     filter_config JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT TRUE,
@@ -556,7 +557,7 @@ def create_destination(
     currency: str = DEFAULT_CURRENCY,
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
-    check_interval_minutes: int = 60,
+    check_interval_minutes: int = DEFAULT_CHECK_INTERVAL_MINUTES,
     cooldown_hours: int = 12,
     filter_config: Optional[dict[str, Any]] = None,
     is_active: bool = True,
@@ -633,7 +634,7 @@ def update_destination(
     currency: str = DEFAULT_CURRENCY,
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
-    check_interval_minutes: int = 60,
+    check_interval_minutes: int = DEFAULT_CHECK_INTERVAL_MINUTES,
     cooldown_hours: int = 12,
     filter_config: Optional[dict[str, Any]] = None,
     is_active: bool = True,
@@ -1205,6 +1206,16 @@ def record_price_snapshot(
                     ds.all_time_low_price AS slot_all_time_low,
                     ds.last_alerted_at,
                     ds.last_alerted_price,
+                    ds.latest_cheapest_price AS prev_cheapest_price,
+                    ds.latest_best_price AS prev_best_price,
+                    (
+                        SELECT COALESCE(al.cheapest_price, al.best_price)
+                        FROM alert_logs al
+                        WHERE al.date_slot_id = %s
+                          AND POSITION('ALL_TIME_LOW' IN al.trigger_type) > 0
+                        ORDER BY al.sent_at DESC
+                        LIMIT 1
+                    ) AS last_atl_alerted_price,
                     (
                         SELECT MIN(ps.cheapest_tab_price)
                         FROM price_snapshots ps
@@ -1225,7 +1236,7 @@ def record_price_snapshot(
                 FROM date_slots ds
                 WHERE ds.id = %s;
                 """,
-                (date_slot_id, date_slot_id, date_slot_id, date_slot_id),
+                (date_slot_id, date_slot_id, date_slot_id, date_slot_id, date_slot_id),
             )
             stats_row_raw = cur.fetchone()
             stats_row = dict(stats_row_raw) if stats_row_raw else {}
@@ -1323,6 +1334,10 @@ def record_price_snapshot(
         conn.commit()
     clear_db_cache()
 
+    prev_cheapest = _to_float(stats_row.get("prev_cheapest_price"))
+    prev_best = _to_float(stats_row.get("prev_best_price"))
+    prev_effective_price = prev_cheapest if prev_cheapest is not None else prev_best
+
     return {
         "snapshot_id": snapshot_id,
         "scraped_at": scraped_at,
@@ -1332,6 +1347,8 @@ def record_price_snapshot(
         "rolling_7d_count": rolling_7d_count,
         "last_alerted_at": stats_row.get("last_alerted_at"),
         "last_alerted_price": _to_float(stats_row.get("last_alerted_price")),
+        "prev_effective_price": prev_effective_price,
+        "last_atl_alerted_price": _to_float(stats_row.get("last_atl_alerted_price")),
     }
 
 
@@ -1445,7 +1462,8 @@ def record_alert_and_update_slots(
                 if ins_alert:
                     log_ids.append(int(ins_alert["id"]))
 
-                if slot_id is not None and cheapest_dec is not None:
+                effective_dec = cheapest_dec if cheapest_dec is not None else best_dec
+                if slot_id is not None and effective_dec is not None:
                     cur.execute(
                         """
                         UPDATE date_slots
@@ -1453,7 +1471,7 @@ def record_alert_and_update_slots(
                             last_alerted_price = %s
                         WHERE id = %s;
                         """,
-                        (cheapest_dec, int(slot_id)),
+                        (effective_dec, int(slot_id)),
                     )
         conn.commit()
     clear_db_cache()

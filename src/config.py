@@ -6,9 +6,13 @@ for FlightPulse Matrix v4.0.
 from __future__ import annotations
 
 import base64
+import collections
 import concurrent.futures
+import hashlib
 import logging
 import os
+import random
+import re
 import socket
 import sys
 import threading
@@ -71,7 +75,8 @@ APP_PASSWORD: str = _get_setting("APP_PASSWORD", "flightpulse-matrix-2026")
 MAX_DESTINATIONS: int = int(_get_setting("MAX_DESTINATIONS", "20"))
 MAX_SLOTS_PER_DESTINATION: int = int(_get_setting("MAX_SLOTS_PER_DESTINATION", "10"))
 MAX_TOTAL_SLOTS: int = MAX_DESTINATIONS * MAX_SLOTS_PER_DESTINATION
-MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "40"))
+MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "50"))
+DEFAULT_CHECK_INTERVAL_MINUTES: int = int(_get_setting("DEFAULT_CHECK_INTERVAL_MINUTES", "240"))
 
 # Google Flights Schedule Advance Booking Window (airline industry 330-337 day release)
 GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS: int = int(_get_setting("GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS", "330"))
@@ -246,6 +251,8 @@ def verify_proxy_tunnel(proxy_url: str, timeout: float = 2.0) -> tuple[bool, Opt
                 ok, reason = True, None
             elif "fortigate" in lower_resp or "proxy.http" in lower_resp or "403" in first_line:
                 ok, reason = False, "Firewall local bloqueó Proxy.HTTP (FortiGate 403)"
+            elif "402" in first_line:
+                ok, reason = False, "Cuota de proxy agotada (HTTP 402)"
             elif "407" in first_line:
                 ok, reason = False, "Credenciales de proxy rechazadas (HTTP 407)"
             else:
@@ -259,68 +266,224 @@ def verify_proxy_tunnel(proxy_url: str, timeout: float = 2.0) -> tuple[bool, Opt
     return ok, reason
 
 
-def get_proxy_pool(verify_tunnel: bool = False) -> list[Optional[str]]:
+def parse_proxy_list_raw(raw_list: str) -> list[str]:
+    """Parse a comma/newline-separated proxy list into normalized proxy URLs."""
+    candidates: list[str] = []
+    if not raw_list:
+        return candidates
+    for item in raw_list.replace("\n", ",").split(","):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        if not cleaned.startswith(("http://", "https://", "socks5://", "socks4://")):
+            parts = cleaned.split(":")
+            if len(parts) == 4:
+                ip, port, user, pwd = parts
+                cleaned = f"http://{user}:{pwd}@{ip}:{port}"
+            elif len(parts) == 2:
+                ip, port = parts
+                cleaned = f"http://{ip}:{port}"
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    return candidates
+
+
+def get_proxy_account(proxy_url: Optional[str]) -> str:
+    """Return a non-secret account/channel identifier for a proxy URL."""
+    if proxy_url is None:
+        return "direct"
+    try:
+        parsed = urlparse(proxy_url)
+        host = parsed.hostname or ""
+        port = parsed.port
+        if parsed.scheme.startswith("socks") and host in ("127.0.0.1", "localhost", "::1") and port == 40000:
+            return "warp"
+        if parsed.username:
+            return unquote(parsed.username)
+        return f"{host}:{port}" if port else (host or "proxy")
+    except Exception:
+        return "proxy"
+
+
+def get_proxy_tier(proxy_url: Optional[str]) -> str:
+    """Classify a network channel into tier1_warp, tier2_direct, or tier3_proxy."""
+    if proxy_url is None:
+        return "tier2_direct"
+    if get_proxy_account(proxy_url) == "warp":
+        return "tier1_warp"
+    return "tier3_proxy"
+
+
+def redact_account_for_log(account: str) -> str:
+    """Mask proxy credential username so public logs never expose full account identifiers."""
+    clean = str(account or "").strip()
+    if not clean or clean in ("direct", "warp", "none"):
+        return clean or "direct"
+    if ":" in clean and "@" not in clean:
+        # host:port fallback without username
+        short_h = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:6]
+        return f"proxy#{short_h}"
+    suffix = clean[-3:] if len(clean) > 3 else "***"
+    return f"acct_****{suffix}"
+
+
+def redact_proxy_for_log(proxy_url: Optional[str]) -> str:
     """
-    Build an ordered list of available proxy servers from PROXY_LIST and SOCKS5_PROXY.
-    Reads PROXY_LIST and SOCKS5_PROXY dynamically so updates in `.env` take effect.
-    When `verify_tunnel=True`, tests proxy CONNECT tunnels concurrently with a 300s cache
-    and returns `[None]` (direct connection) immediately if all proxies are blocked.
+    Return a safe, secret-free identifier for a proxy URL suitable for public logs.
+    Never exposes passwords, full usernames, or proxy IPs/ports.
+    """
+    if not proxy_url:
+        return "direct"
+    acct = get_proxy_account(proxy_url)
+    if acct == "warp":
+        return "warp"
+    short_hash = hashlib.sha256(proxy_url.encode("utf-8")).hexdigest()[:6]
+    masked_acct = redact_account_for_log(acct)
+    return f"webshare:{masked_acct}#{short_hash}"
+
+
+_PROXY_URL_CREDS_RE = re.compile(
+    r"(https?|socks5h?|socks4)://[^\s:@/\"']+:[^\s@/\"']+@[^\s\"',;)\]]+",
+    re.IGNORECASE,
+)
+_BARE_HOST_PORT_USER_RE = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}(?::[^\s,;]+){0,2}\b"
+)
+
+
+def sanitize_log_text(text: Any) -> str:
+    """
+    Scrub proxy URLs with credentials (`scheme://user:pass@ip:port`), bare proxy IPs/ports,
+    and known PROXY_LIST credentials from exception/log strings before printing.
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    cleaned = _PROXY_URL_CREDS_RE.sub(r"\1://[REDACTED_PROXY]", raw)
+    cleaned = _BARE_HOST_PORT_USER_RE.sub("[REDACTED_ENDPOINT]", cleaned)
+
+    raw_list = _get_setting("PROXY_LIST", RAW_PROXY_LIST)
+    if raw_list:
+        for p in parse_proxy_list_raw(raw_list):
+            if p in cleaned:
+                cleaned = cleaned.replace(p, redact_proxy_for_log(p))
+            try:
+                parsed = urlparse(p)
+                if parsed.password and parsed.password in cleaned:
+                    cleaned = cleaned.replace(parsed.password, "***")
+                if parsed.username and parsed.username in cleaned:
+                    cleaned = cleaned.replace(parsed.username, redact_account_for_log(parsed.username))
+                if parsed.hostname and parsed.hostname in cleaned:
+                    cleaned = cleaned.replace(parsed.hostname, "[REDACTED_IP]")
+            except Exception:
+                pass
+    return cleaned
+
+
+def interleave_proxies_by_account(
+    proxies: list[str],
+    random_offset: bool = True,
+    rng: Optional[random.Random] = None,
+) -> list[str]:
+    """
+    Group proxies by credential username, interleave across accounts in round-robin
+    (A_0, B_0, A_1, B_1, ...), and optionally apply a random starting offset.
+    """
+    if len(proxies) <= 1:
+        return list(proxies)
+
+    buckets: "collections.OrderedDict[str, list[str]]" = collections.OrderedDict()
+    for p in proxies:
+        acct = get_proxy_account(p)
+        buckets.setdefault(acct, []).append(p)
+
+    interleaved: list[str] = []
+    account_lists = list(buckets.values())
+    max_len = max(len(lst) for lst in account_lists)
+    for idx in range(max_len):
+        for lst in account_lists:
+            if idx < len(lst):
+                interleaved.append(lst[idx])
+
+    if random_offset and len(interleaved) > 1:
+        r = rng or random
+        offset = r.randrange(len(interleaved))
+        interleaved = interleaved[offset:] + interleaved[:offset]
+
+    return interleaved
+
+
+def get_proxy_pool(
+    verify_tunnel: bool = False,
+    random_offset: bool = True,
+    include_direct: bool = True,
+) -> list[Optional[str]]:
+    """
+    Build an ordered pool prioritizing zero-cost channels first:
+      - Nivel 1: Cloudflare WARP (`SOCKS5_PROXY`)
+      - Nivel 2: Direct (`None`)
+      - Nivel 3: `PROXY_LIST` (Webshare), grouped by account, interleaved round-robin
+                 with a random initial rotation offset per run.
     """
     raw_list = _get_setting("PROXY_LIST", RAW_PROXY_LIST)
     socks5_proxy = _get_setting("SOCKS5_PROXY", SOCKS5_PROXY)
-    candidates: list[str] = []
+    proxy_candidates = parse_proxy_list_raw(raw_list)
 
-    if raw_list:
-        for item in raw_list.replace("\n", ",").split(","):
-            cleaned = item.strip()
-            if not cleaned:
-                continue
-            # Auto-convert raw "ip:port:user:pass" or "ip:port" export format
-            if not cleaned.startswith(("http://", "https://", "socks5://", "socks4://")):
-                parts = cleaned.split(":")
-                if len(parts) == 4:
-                    ip, port, user, pwd = parts
-                    cleaned = f"http://{user}:{pwd}@{ip}:{port}"
-                elif len(parts) == 2:
-                    ip, port = parts
-                    cleaned = f"http://{ip}:{port}"
+    pool: list[Optional[str]] = []
 
-            if cleaned and cleaned not in candidates:
-                candidates.append(cleaned)
+    # Nivel 1: Cloudflare WARP (SOCKS5_PROXY)
+    if socks5_proxy:
+        if verify_tunnel:
+            warp_ok, warp_reason = verify_proxy_tunnel(socks5_proxy)
+            if warp_ok:
+                pool.append(socks5_proxy)
+            elif warp_reason:
+                logger.info(
+                    "WARP SOCKS5_PROXY unavailable (%s); continuing to Nivel 2 Direct.",
+                    sanitize_log_text(warp_reason),
+                )
+        elif is_proxy_reachable(socks5_proxy):
+            pool.append(socks5_proxy)
+        else:
+            logger.debug("Skipping unreachable local WARP proxy: %s", redact_proxy_for_log(socks5_proxy))
 
-    if socks5_proxy and socks5_proxy not in candidates:
-        candidates.append(socks5_proxy)
+    # Nivel 2: Direct connection
+    if include_direct:
+        pool.append(None)
 
-    verified_proxies: list[Optional[str]] = []
+    # Nivel 3: PROXY_LIST (interleaved by account with random rotation offset)
+    verified_tier3: list[str] = []
     if not verify_tunnel:
-        for proxy in candidates:
+        for proxy in proxy_candidates:
+            if proxy == socks5_proxy:
+                continue
             if is_proxy_reachable(proxy):
-                verified_proxies.append(proxy)
+                verified_tier3.append(proxy)
             else:
-                logger.warning("Skipping unreachable local proxy: %s", proxy)
-        return verified_proxies if verified_proxies else [None]
+                logger.warning("Skipping unreachable local proxy: %s", redact_proxy_for_log(proxy))
+    elif proxy_candidates:
+        tier3_targets = [p for p in proxy_candidates if p != socks5_proxy]
+        if tier3_targets:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(tier3_targets))) as executor:
+                results = list(executor.map(verify_proxy_tunnel, tier3_targets))
+            blocked_reasons: set[str] = set()
+            for proxy, (ok, reason) in zip(tier3_targets, results):
+                if ok:
+                    verified_tier3.append(proxy)
+                elif reason:
+                    blocked_reasons.add(sanitize_log_text(reason))
+            if not verified_tier3 and blocked_reasons:
+                logger.warning(
+                    "None of the %d configured Tier-3 proxies could establish a tunnel (%s).",
+                    len(tier3_targets),
+                    "; ".join(sorted(blocked_reasons)[:2]),
+                )
 
-    if candidates:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(candidates))) as pool:
-            results = list(pool.map(verify_proxy_tunnel, candidates))
-        blocked_reasons: set[str] = set()
-        for proxy, (ok, reason) in zip(candidates, results):
-            if ok:
-                verified_proxies.append(proxy)
-            elif reason:
-                blocked_reasons.add(reason)
+    pool.extend(interleave_proxies_by_account(verified_tier3, random_offset=random_offset))
 
-        if not verified_proxies and blocked_reasons:
-            logger.warning(
-                "None of the %d configured proxies could establish a tunnel (%s); using direct connection.",
-                len(candidates),
-                "; ".join(sorted(blocked_reasons)[:2]),
-            )
-
-    if not verified_proxies:
+    if not pool:
         return [None]
-
-    return verified_proxies
+    return pool
 
 
 def test_proxy_connection(proxy_url: Optional[str] = None, timeout: float = 5.0) -> dict[str, Any]:
@@ -330,7 +493,7 @@ def test_proxy_connection(proxy_url: Optional[str] = None, timeout: float = 5.0)
     """
     start_t = time.perf_counter()
     res: dict[str, Any] = {
-        "proxy_url": proxy_url or "Conexión Directa",
+        "proxy_url": redact_proxy_for_log(proxy_url) if proxy_url else "Conexión Directa",
         "is_direct": proxy_url is None,
         "success": False,
         "ip": "Desconocido",
@@ -377,7 +540,7 @@ def test_proxy_connection(proxy_url: Optional[str] = None, timeout: float = 5.0)
         if "CONNECT tunnel failed, response 403" in err_str or "FortiGate" in err_str:
             res["error"] = "Bloqueado por firewall local (FortiGate Proxy.HTTP) — disponible en GitHub Actions"
         else:
-            res["error"] = err_str
+            res["error"] = sanitize_log_text(err_str)
         res["latency_ms"] = int((time.perf_counter() - start_t) * 1000)
 
     return res

@@ -28,6 +28,7 @@ from src.alerts import send_test_digest_alert
 from src.config import (
     APP_PASSWORD,
     COMMON_AIRLINES,
+    DEFAULT_CHECK_INTERVAL_MINUTES,
     DEFAULT_CURRENCY,
     DEFAULT_GL,
     DEFAULT_HL,
@@ -37,6 +38,7 @@ from src.config import (
     MAX_TOTAL_SLOTS,
     get_flight_window_status,
     get_proxy_pool,
+    sanitize_log_text,
     test_proxy_connection,
 )
 from src.db import (
@@ -436,7 +438,7 @@ def render_tab1_matrix_explorer() -> None:
                     </div>
                     <div style="margin-top: 8px; font-size: 0.88rem; color: #94A3B8;">
                         <strong>Meta:</strong> <span style="color: #34D399; font-weight: 600;">${float(selected_dest['target_price']):,.0f} {selected_dest['currency']}</span>
-                        &nbsp;•&nbsp; <strong>Escaneo:</strong> Cada {selected_dest.get('check_interval_minutes', 60)}m
+                        &nbsp;•&nbsp; <strong>Escaneo:</strong> Cada {selected_dest.get('check_interval_minutes', DEFAULT_CHECK_INTERVAL_MINUTES)}m
                         &nbsp;•&nbsp; <strong>Cooldown:</strong> {selected_dest.get('cooldown_hours', 12)}h
                     </div>
                 </div>
@@ -1022,9 +1024,17 @@ def render_tab2_destination_and_generator() -> None:
                 key=f"dest_seat_{key_suffix}",
             )
         with r2c4:
-            interval_choices = [60, 180, 360]
-            curr_interval = int(existing_dest.get("check_interval_minutes", 60)) if existing_dest else 60
-            interval_idx = interval_choices.index(curr_interval) if curr_interval in interval_choices else 0
+            interval_choices = [60, 180, 240, 360]
+            curr_interval = (
+                int(existing_dest.get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES))
+                if existing_dest
+                else DEFAULT_CHECK_INTERVAL_MINUTES
+            )
+            interval_idx = (
+                interval_choices.index(curr_interval)
+                if curr_interval in interval_choices
+                else interval_choices.index(240)
+            )
             check_interval_val = st.selectbox(
                 "Escaneo",
                 options=interval_choices,
@@ -1040,7 +1050,7 @@ def render_tab2_destination_and_generator() -> None:
                 options=cooldown_choices,
                 index=cooldown_choices.index(curr_cd) if curr_cd in cooldown_choices else 1,
                 format_func=lambda h: f"{h} horas",
-                help="Espera mínima entre alertas (salvo caída adicional de -5%).",
+                help="Espera mínima entre re-alertas por Meta cuando cae >=3% (Bajo Histórico y caídas >=5% siempre alertan inmediato).",
                 key=f"dest_cooldown_{key_suffix}",
             )
 
@@ -1810,8 +1820,7 @@ def render_tab3_scanner_and_logs() -> None:
     with col_tg:
         st.markdown("### Probador de Alerta Telegram (Verificado)")
         st.caption(
-            "Envía una tarjeta consolidada real a Telegram. Si las fechas están fuera de la ventana de 330 días, "
-            "informa su fecha exacta de liberación sin inventar precios ni enlaces ficticios."
+            "Envía una tarjeta HTML compacta de prueba a Telegram (Meta / Bajo Histórico, excluyendo >330 días)."
         )
         tg_dest_options: list[tuple[Optional[int], str]] = [
             (None, "Primer Destino Activo / Monitoreado")
@@ -1834,8 +1843,8 @@ def render_tab3_scanner_and_logs() -> None:
                 st.success(f"Reporte entregado exitosamente a Telegram ({detail}).")
             else:
                 st.error(f"No se pudo enviar a Telegram: {detail}")
-            with st.expander("Ver Markdown del Mensaje Enviado", expanded=True):
-                st.code(md_preview, language="markdown")
+            with st.expander("Ver HTML del Mensaje Enviado", expanded=True):
+                st.code(md_preview, language="html")
 
     # --------------------------------------------------------------------------
     # SCRAPER HEALTH METRICS & ALERT LOGS TABLE
@@ -1930,7 +1939,11 @@ def render_tab3_scanner_and_logs() -> None:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(targets_to_test)))) as ex:
                     test_results = list(ex.map(test_proxy_connection, targets_to_test))
             for res in test_results:
-                status_desc = "Acceso Correcto (HTTP 200)" if res["success"] else f"Error: {res['error'] or 'Bloqueado'}"
+                status_desc = (
+                    "Acceso Correcto (HTTP 200)"
+                    if res["success"]
+                    else f"Error: {sanitize_log_text(res['error']) or 'Bloqueado'}"
+                )
                 results_list.append({
                     "Proxy / Red": res["proxy_url"],
                     "IP Pública Detectada": res["ip"],
@@ -1961,7 +1974,7 @@ def main() -> None:
             - **Capacidad Total:** `{MAX_TOTAL_SLOTS}` Date Slots
             - **Extracción Dual:** `Más baratos` vs `Mejores`
             - **Ventana Oficial:** `330 días` máx. anticipación
-            - **Anti-Ban Queue:** Sharded en lotes cada 25m
+            - **Anti-Ban Queue:** Sharded cada 60m (`50` slots/run)
             """
         )
         st.markdown("---")

@@ -25,13 +25,26 @@ if str(ROOT_DIR) not in sys.path:
 
 from streamlit.testing.v1 import AppTest
 
+from src.alerts import (
+    evaluate_slot_alert_triggers,
+    format_consolidated_destination_digest,
+)
 from src.config import (
     MAX_DESTINATIONS,
     MAX_SLOTS_PER_RUN,
     MAX_TOTAL_SLOTS,
     get_flight_window_status,
+    get_proxy_account,
     get_proxy_pool,
+    get_proxy_tier,
+    interleave_proxies_by_account,
+    redact_account_for_log,
+    redact_proxy_for_log,
+    sanitize_log_text,
 )
+from src.ds1_parser import FlightOffer
+from src.runner import ProxyCircuitBreaker
+from src.scraper import PooledPatchrightSession, consolidate_slot_offers
 from src.db import (
     bulk_create_date_slots,
     clear_db_cache,
@@ -513,6 +526,421 @@ def bench_11_full_streamlit_apptest() -> None:
     measure("11d. apptest_tab3_scope_switch", _app_tab3_interaction)
 
 
+def bench_12_proxy_rotation_and_circuit_breaker() -> None:
+    """Verify Tier-1/2/3 ordering, interleaved rotation, random offset, and 402/407 circuit breaker."""
+    def _proxy_tests() -> str:
+        import random as _rnd
+
+        sample = [
+            "http://acctA:pw@1.1.1.1:8001",
+            "http://acctA:pw@1.1.1.2:8002",
+            "http://acctB:pw@2.2.2.1:8001",
+            "http://acctB:pw@2.2.2.2:8002",
+        ]
+        interleaved = interleave_proxies_by_account(sample, random_offset=False)
+        assert [get_proxy_account(p) for p in interleaved] == ["acctA", "acctB", "acctA", "acctB"]
+
+        starts = {
+            interleave_proxies_by_account(sample, random_offset=True, rng=_rnd.Random(s))[0]
+            for s in range(20)
+        }
+        assert len(starts) > 1, "Expected random initial offset to rotate starting proxy across runs"
+
+        assert get_proxy_tier("socks5://127.0.0.1:40000") == "tier1_warp"
+        assert get_proxy_tier(None) == "tier2_direct"
+        assert get_proxy_tier(sample[0]) == "tier3_proxy"
+
+        # Circuit breaker: HTTP 402/407 immediately marks entire account exhausted
+        breaker = ProxyCircuitBreaker(max_consecutive_failures=3)
+        tripped_407 = breaker.record_failure(sample[0], "Tunnel rejected (HTTP 407 Proxy Auth Required)")
+        assert tripped_407 is True
+        assert "acctA" in breaker.exhausted_accounts
+        assert breaker.is_available(sample[1]) is False, "All ports of acctA must be skipped"
+        assert breaker.is_available(sample[2]) is True, "acctB must remain available"
+        assert breaker.is_available(None) is True, "Direct fallback must remain available"
+
+        # HTTP 402 on acctC
+        acct_c = "http://acctC:pw@3.3.3.1:8001"
+        assert breaker.record_failure(acct_c, "HTTP 402 Payment Required") is True
+        assert "acctC" in breaker.exhausted_accounts
+
+        # 3 consecutive tunnel failures trip acctB; success resets counter
+        assert breaker.record_failure(sample[2], "ERR_TUNNEL_CONNECTION_FAILED") is False
+        assert breaker.record_failure(sample[2], "ERR_TUNNEL_CONNECTION_FAILED") is False
+        breaker.record_success(sample[2])
+        assert breaker.is_available(sample[3]) is True
+        assert breaker.record_failure(sample[2], "ERR_TUNNEL_CONNECTION_FAILED") is False
+        assert breaker.record_failure(sample[2], "ERR_TUNNEL_CONNECTION_FAILED") is False
+        assert breaker.record_failure(sample[3], "ERR_TUNNEL_CONNECTION_FAILED") is True
+        assert "acctB" in breaker.exhausted_accounts
+        assert breaker.filter_available([None, *sample]) == [None]
+
+        return "interleave + random_offset + 402/407 + 3x_tunnel circuit breaker OK"
+
+    measure("12. unit_proxy_rotation_breaker", _proxy_tests)
+
+
+def bench_13_alert_triggers_meta_and_low() -> None:
+    """Verify 2-trigger alert engine (Meta & Bajo Histórico), no SHARP_DROP, and FUTURE_RELEASE exclusion."""
+    def _trigger_tests() -> str:
+        today = datetime.date.today()
+        active_out = (today + datetime.timedelta(days=45)).strftime("%Y-%m-%d")
+        active_ret = (today + datetime.timedelta(days=55)).strftime("%Y-%m-%d")
+        future_out = (today + datetime.timedelta(days=400)).strftime("%Y-%m-%d")
+        future_ret = (today + datetime.timedelta(days=410)).strftime("%Y-%m-%d")
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        base_slot = {
+            "id": 99,
+            "label": "Vie 10 Oct - Lun 20 Oct (10d)",
+            "outbound_date": active_out,
+            "return_date": active_ret,
+            "google_flights_url": "https://www.google.com/travel/flights?tfs=test",
+            "target_price": 10000.0,
+            "cooldown_hours": 12,
+            "filter_config": {},
+        }
+
+        # 1. FUTURE_RELEASE (>330d) must always be excluded
+        fut_slot = {**base_slot, "outbound_date": future_out, "return_date": future_ret}
+        assert (
+            evaluate_slot_alert_triggers(
+                fut_slot,
+                {"cheapest_tab_price": 5000.0, "best_tab_price": 6000.0},
+                {"historical_min_price": 15000.0},
+            )
+            is None
+        )
+
+        # 2. SHARP_DROP removed: 20% drop vs rolling_7d_avg must NOT trigger if above target and no ATL
+        no_sharp = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 12000.0, "best_tab_price": 12500.0},
+            {"historical_min_price": None, "rolling_7d_avg": 20000.0},
+        )
+        assert no_sharp is None, "SHARP_DROP must be completely removed"
+
+        # 3. TARGET_BREACH (Meta): immediate on first breach & on crossing down from > target
+        t1 = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 9900.0, "best_tab_price": 10500.0},
+            {"historical_min_price": None, "last_alerted_at": None, "last_alerted_price": None},
+        )
+        assert t1 is not None and t1["trigger_type"] == "TARGET_BREACH"
+
+        t_cross = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 9900.0, "best_tab_price": None},
+            {
+                "historical_min_price": None,
+                "last_alerted_at": now_utc - datetime.timedelta(hours=1),
+                "last_alerted_price": 9800.0,
+                "prev_effective_price": 10200.0,
+            },
+        )
+        assert t_cross is not None and t_cross["trigger_type"] == "TARGET_BREACH"
+
+        # Staying below target: <3% extra drop blocked; >=3% needs cooldown; >=5% bypasses cooldown
+        assert (
+            evaluate_slot_alert_triggers(
+                base_slot,
+                {"cheapest_tab_price": 9800.0, "best_tab_price": 10000.0},
+                {
+                    "historical_min_price": 9800.0,
+                    "last_alerted_at": now_utc - datetime.timedelta(hours=24),
+                    "last_alerted_price": 9900.0,
+                    "prev_effective_price": 9850.0,
+                },
+            )
+            is None
+        )
+        assert (
+            evaluate_slot_alert_triggers(
+                base_slot,
+                {"cheapest_tab_price": 9650.0, "best_tab_price": 10000.0},
+                {
+                    "historical_min_price": 9900.0,
+                    "last_alerted_at": now_utc - datetime.timedelta(hours=2),
+                    "last_alerted_price": 10000.0,
+                    "prev_effective_price": 9900.0,
+                    "last_atl_alerted_price": 9700.0,
+                },
+            )
+            is None
+        )
+        t_3pct_after_cd = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 9650.0, "best_tab_price": 10000.0},
+            {
+                "historical_min_price": 9900.0,
+                "last_alerted_at": now_utc - datetime.timedelta(hours=13),
+                "last_alerted_price": 10000.0,
+                "prev_effective_price": 9900.0,
+                "last_atl_alerted_price": 9700.0,
+            },
+        )
+        assert t_3pct_after_cd is not None and t_3pct_after_cd["trigger_type"] == "TARGET_BREACH"
+
+        t_5pct_bypass = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 9500.0, "best_tab_price": 10000.0},
+            {
+                "historical_min_price": 9900.0,
+                "last_alerted_at": now_utc - datetime.timedelta(hours=1),
+                "last_alerted_price": 10000.0,
+                "prev_effective_price": 9900.0,
+                "last_atl_alerted_price": 9600.0,
+            },
+        )
+        assert t_5pct_bypass is not None and t_5pct_bypass["trigger_type"] == "TARGET_BREACH"
+
+        # 4. ALL_TIME_LOW (Bajo Histórico): requires >=2% drop vs reference_low and bypasses cooldown
+        assert (
+            evaluate_slot_alert_triggers(
+                base_slot,
+                {"cheapest_tab_price": 19700.0, "best_tab_price": 20000.0},
+                {
+                    "historical_min_price": 20000.0,
+                    "last_alerted_at": now_utc - datetime.timedelta(minutes=10),
+                    "last_alerted_price": 20000.0,
+                },
+            )
+            is None
+        )
+        t_atl = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": 19600.0, "best_tab_price": 20000.0},
+            {
+                "historical_min_price": 20000.0,
+                "last_alerted_at": now_utc - datetime.timedelta(minutes=10),
+                "last_alerted_price": 20000.0,
+            },
+        )
+        assert t_atl is not None and t_atl["trigger_type"] == "ALL_TIME_LOW"
+
+        # 5. effective_price fallback to best_tab_price when cheapest_tab_price is None
+        t_fallback = evaluate_slot_alert_triggers(
+            base_slot,
+            {"cheapest_tab_price": None, "best_tab_price": 9800.0},
+            {"historical_min_price": None},
+        )
+        assert t_fallback is not None and t_fallback["effective_price"] == 9800.0
+
+        return "Meta + Bajo Histórico + no SHARP_DROP + FUTURE_RELEASE guard OK"
+
+    measure("13. unit_alert_triggers_meta_low", _trigger_tests)
+
+
+def bench_14_compact_html_rendering() -> None:
+    """Verify compact HTML Telegram formatting, escaping, self-transfer mark, and mixed triggers."""
+    def _html_tests() -> str:
+        today = datetime.date.today()
+        d1_out = (today + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        d1_ret = (today + datetime.timedelta(days=46)).strftime("%Y-%m-%d")
+        d2_out = (today + datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+        d2_ret = (today + datetime.timedelta(days=76)).strftime("%Y-%m-%d")
+        fut_out = (today + datetime.timedelta(days=400)).strftime("%Y-%m-%d")
+        fut_ret = (today + datetime.timedelta(days=410)).strftime("%Y-%m-%d")
+
+        dest_meta = {
+            "id": 1,
+            "name": "Conexión Europa <Islandia & Más>",
+            "origin": "MEX, NLU",
+            "destination": "MAD",
+            "currency": "MXN",
+        }
+        slots = [
+            {
+                "label": "Vie 27 Ago - Dom 12 Sep (16d)",
+                "outbound_date": d1_out,
+                "return_date": d1_ret,
+                "google_flights_url": "https://www.google.com/travel/flights?tfs=abc&hl=es",
+                "cheapest_tab_price": 17993.0,
+                "cheapest_airline": "Iberia",
+                "cheapest_stops": "Directo",
+                "cheapest_duration": "10 h 35 min",
+                "origin_airport": "MEX",
+                "destination_airport": "MAD",
+                "is_self_transfer": True,
+                "best_tab_price": 18500.0,
+                "best_stops": "1 escala",
+                "best_duration": "12 h 10 min",
+                "best_origin_airport": "MEX",
+                "best_destination_airport": "MAD",
+                "trigger_type": "TARGET_BREACH",
+            },
+            {
+                "label": "Vie 10 Sep - Dom 26 Sep (16d)",
+                "outbound_date": d2_out,
+                "return_date": d2_ret,
+                "google_flights_url": "https://www.google.com/travel/flights?tfs=def&hl=es",
+                "cheapest_tab_price": 19100.0,
+                "cheapest_airline": "KLM",
+                "cheapest_stops": "2 escalas",
+                "cheapest_duration": "15 h 20 min",
+                "origin_airport": "MEX",
+                "destination_airport": "AMS",
+                "is_self_transfer": False,
+                "best_tab_price": None,
+                "trigger_type": "ALL_TIME_LOW",
+            },
+            {
+                "label": "Futuro Lejano",
+                "outbound_date": fut_out,
+                "return_date": fut_ret,
+                "google_flights_url": "https://www.google.com/travel/flights?tfs=fut",
+                "cheapest_tab_price": 5000.0,
+                "trigger_type": "TARGET_BREACH",
+            },
+        ]
+
+        rendered = format_consolidated_destination_digest(dest_meta, slots, is_test=False)
+        assert "<b>Conexión Europa &lt;Islandia &amp; Más&gt;</b> | Meta / Bajo Histórico" in rendered
+        assert "1. Vie 27 Ago - Dom 12 Sep · Meta" in rendered
+        assert "2. Vie 10 Sep - Dom 26 Sep · Bajo Histórico" in rendered
+        assert "Barato: $17,993 MXN (MEX -&gt; MAD, Directo ⚠️, 10 h 35 min)" in rendered
+        assert "Mejor: $18,500 MXN (MEX -&gt; MAD, 1 escala, 12 h 10 min)" in rendered
+        assert '<a href="https://www.google.com/travel/flights?tfs=abc&amp;hl=es"><b>[Reservar]</b></a>' in rendered
+        assert "Iberia" not in rendered and "KLM" not in rendered
+        assert "Futuro Lejano" not in rendered
+        # Slot 2 had best_tab_price=None so only Barato: must appear for slot 2
+        assert rendered.count("Mejor:") == 1
+
+        test_rendered = format_consolidated_destination_digest(dest_meta, slots[:1], is_test=True)
+        assert "<b>[PRUEBA] Conexión Europa &lt;Islandia &amp; Más&gt;</b> | Meta" in test_rendered
+        assert " · Meta" not in test_rendered, "Single-trigger digest must not add per-slot suffix"
+
+        return "compact HTML + escape + mixed triggers + PRUEBA prefix OK"
+
+    measure("14. unit_compact_html_rendering", _html_tests)
+
+
+def bench_15_proxy_redaction_and_sanitization() -> None:
+    """Verify proxy URLs, usernames, passwords, and IPs are scrubbed from logs/exceptions."""
+    def _redaction_tests() -> str:
+        secret_proxy = "http://zjmkogsd:supersecret99@45.38.107.97:6014"
+        redacted = redact_proxy_for_log(secret_proxy)
+        assert "zjmkogsd" not in redacted
+        assert "supersecret99" not in redacted
+        assert "45.38.107.97" not in redacted
+        assert "6014" not in redacted
+        assert redacted.startswith("webshare:acct_****gsd#")
+
+        assert redact_proxy_for_log(None) == "direct"
+        assert redact_proxy_for_log("socks5://127.0.0.1:40000") == "warp"
+        assert redact_account_for_log("zjmkogsd") == "acct_****gsd"
+
+        fake_exc = RuntimeError(
+            "curl: (56) Proxy CONNECT aborted via http://user:secretpass@1.2.3.4:8080 and 9.8.7.6:3128"
+        )
+        scrubbed = sanitize_log_text(fake_exc)
+        assert "secretpass" not in scrubbed
+        assert "1.2.3.4" not in scrubbed
+        assert "8080" not in scrubbed
+        assert "9.8.7.6" not in scrubbed
+        assert "http://user:secretpass@1.2.3.4:8080" not in scrubbed
+        assert "[REDACTED_PROXY]" in scrubbed
+        return "redact_proxy_for_log + sanitize_log_text OK"
+
+    measure("15. unit_proxy_redaction_sanitize", _redaction_tests)
+
+
+def bench_16_cheapest_click_failure_tolerance() -> None:
+    """Verify cheapest_tab.click() timeout returns cleanly without aborting the slot."""
+    def _click_fail_test() -> str:
+        class _DummyTab:
+            def count(self) -> int:
+                return 1
+
+            def click(self, timeout: int = 5000) -> None:
+                raise TimeoutError("Locator.click: Timeout 5000ms exceeded")
+
+        class _DummyLocator:
+            def __init__(self) -> None:
+                self.first = _DummyTab()
+
+            def filter(self, **kwargs: Any) -> "_DummyLocator":
+                return self
+
+        class _DummyPage:
+            def locator(self, sel: str) -> _DummyLocator:
+                return _DummyLocator()
+
+            def get_by_role(self, role: str, **kwargs: Any) -> _DummyLocator:
+                return _DummyLocator()
+
+            def on(self, ev: str, fn: Any) -> None:
+                pass
+
+            def remove_listener(self, ev: str, fn: Any) -> None:
+                pass
+
+        sess = PooledPatchrightSession(proxy_url=None, headless=True)
+        best_offers = [
+            FlightOffer(
+                price=15588.0,
+                airline="LATAM",
+                stops="Directo",
+                duration="9 h 30 min",
+                origin_airport="MEX",
+                destination_airport="GRU",
+                tab_source="best",
+            )
+        ]
+        clicked, status = sess._switch_to_cheapest_tab_deterministic(
+            page=_DummyPage(),
+            rpc_payload_counter={"count": 0},
+            best_dom_offers=best_offers,
+        )
+        assert clicked is False
+        assert status == "cheapest_click_timeout"
+
+        # Consolidating with preserved Mejores/ds:1 data still yields valid slot result
+        cons = consolidate_slot_offers(
+            best_dom_offers=best_offers,
+            cheapest_dom_offers=[],
+            rpc_offers=[],
+            ds1_offers=best_offers,
+            ds1_best=best_offers[0],
+        )
+        assert cons is not None
+        assert cons["best_offer"].price == 15588.0
+        assert cons["cheapest_offer"].price == 15588.0
+        return "cheapest_click_timeout preserves Mejores/ds:1 OK"
+
+    measure("16. unit_cheapest_click_tolerance", _click_fail_test)
+
+
+def bench_17_min_offer_consolidation() -> None:
+    """Verify consolidation picks min(dom_cheapest, rpc_cheapest, ds1_cheapest) and tags source."""
+    def _min_test() -> str:
+        best_dom = [FlightOffer(price=5393.0, airline="Aeromexico", origin_airport="MEX", destination_airport="GUA", tab_source="best")]
+        cheapest_dom = [FlightOffer(price=5393.0, airline="Aeromexico", origin_airport="MEX", destination_airport="GUA", tab_source="cheapest")]
+        rpc_offers = [FlightOffer(price=4100.0, airline="Volaris", origin_airport="MEX", destination_airport="GUA", tab_source="cheapest")]
+        ds1_offers = [FlightOffer(price=3214.0, airline="Aeromexico", origin_airport="MEX", destination_airport="TAP", tab_source="cheapest")]
+
+        cons_ds1 = consolidate_slot_offers(best_dom, cheapest_dom, rpc_offers, ds1_offers, ds1_best=best_dom[0])
+        assert cons_ds1 is not None
+        assert cons_ds1["cheapest_offer"].price == 3214.0
+        assert cons_ds1["cheapest_source"] == "cheapest_ds1_min"
+        assert cons_ds1["best_offer"].price == 5393.0
+
+        cons_rpc = consolidate_slot_offers(best_dom, cheapest_dom, rpc_offers, [], ds1_best=best_dom[0])
+        assert cons_rpc is not None
+        assert cons_rpc["cheapest_offer"].price == 4100.0
+        assert cons_rpc["cheapest_source"] == "cheapest_rpc"
+
+        dom_win = [FlightOffer(price=2946.0, airline="Viva", origin_airport="MEX", destination_airport="TAP", tab_source="cheapest")]
+        cons_dom = consolidate_slot_offers(best_dom, dom_win, rpc_offers, ds1_offers, ds1_best=best_dom[0])
+        assert cons_dom is not None
+        assert cons_dom["cheapest_offer"].price == 2946.0
+        assert cons_dom["cheapest_source"] == "cheapest_dom"
+
+        return "min(dom, rpc, ds1) consolidation + source tagging OK"
+
+    measure("17. unit_min_offer_consolidation", _min_test)
+
+
 def print_summary_table() -> None:
     print("\n" + "=" * 108)
     print(f"{'ACTION':<38} | {'TIME (ms)':>10} | {'SQL':>5} | {'CONNS':>5} | {'STATUS':<6} | {'DETAIL'}")
@@ -538,6 +966,12 @@ def main() -> int:
     bench_9_tab3_scanner_scopes_and_logs()
     bench_10_scraper_parser_and_db_integrity()
     bench_11_full_streamlit_apptest()
+    bench_12_proxy_rotation_and_circuit_breaker()
+    bench_13_alert_triggers_meta_and_low()
+    bench_14_compact_html_rendering()
+    bench_15_proxy_redaction_and_sanitization()
+    bench_16_cheapest_click_failure_tolerance()
+    bench_17_min_offer_consolidation()
     print_summary_table()
     return 0
 

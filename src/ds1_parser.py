@@ -432,7 +432,7 @@ def parse_ds1_from_html(
     return DualTabExtraction(
         cheapest_offer=cheapest_offer,
         best_offer=best_offer,
-        top_offers=sorted_by_price[:5],
+        top_offers=sorted_by_price[:20],
         extraction_source="patchright_ds1",
     )
 
