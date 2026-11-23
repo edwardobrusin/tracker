@@ -148,7 +148,7 @@ def _measure_browser_slot(
             expected_destinations,
         )
 
-        _, cheapest_status = session._switch_to_cheapest_tab_deterministic(
+        _, cheapest_status, _ = session._switch_to_cheapest_tab_deterministic(
             page=page,
             rpc_payload_counter=rpc_payload_counter,
             best_dom_offers=best_dom_offers,

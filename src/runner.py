@@ -253,6 +253,7 @@ def run_sharded_dispatcher(
                 s_id = int(slot["id"])
                 s_label = slot.get("label") or f"{slot.get('outbound_date')} -> {slot.get('return_date')}"
                 url = str(slot["google_flights_url"])
+                date_range_label = f"{slot.get('outbound_date')} -> {slot.get('return_date') or 'OW'}"
 
                 if progress_callback:
                     progress_callback(
@@ -270,6 +271,7 @@ def run_sharded_dispatcher(
                         url=url,
                         pooled_session=session,
                         proxy_url=current_channel,
+                        date_range_label=date_range_label,
                     )
                     if session is not None and session.proxy_url != current_channel:
                         # Session switched in-place (e.g. proxy -> direct)
@@ -278,7 +280,8 @@ def run_sharded_dispatcher(
                         used_channel = current_channel
                 except Exception as slot_exc:
                     logger.warning(
-                        "Slot id=%d scrape failed on (%s, %s): %s",
+                        "[%s] Slot id=%d scrape failed on (%s, %s): %s",
+                        date_range_label,
                         s_id,
                         get_proxy_tier(current_channel),
                         redact_proxy_for_log(current_channel),
@@ -291,7 +294,8 @@ def run_sharded_dispatcher(
                     nxt_idx, nxt_ch, ok_adv = _advance_channel(active_idx)
                     if ok_adv:
                         logger.info(
-                            "Escalating slot id=%d from (%s, %s) to (%s, %s).",
+                            "[%s] Escalating slot id=%d from (%s, %s) to (%s, %s).",
+                            date_range_label,
                             s_id,
                             get_proxy_tier(current_channel),
                             redact_proxy_for_log(current_channel),
@@ -309,11 +313,17 @@ def run_sharded_dispatcher(
                                 url=url,
                                 pooled_session=session,
                                 proxy_url=current_channel,
+                                date_range_label=date_range_label,
                             )
                             used_channel = session.proxy_url if session is not None else current_channel
                         except Exception as esc_exc:
                             breaker.record_failure(current_channel, esc_exc)
-                            logger.warning("Escalated scrape failed for slot id=%d: %s", s_id, sanitize_log_text(esc_exc))
+                            logger.warning(
+                                "[%s] Escalated scrape failed for slot id=%d: %s",
+                                date_range_label,
+                                s_id,
+                                sanitize_log_text(esc_exc),
+                            )
 
                 processed_count += 1
 

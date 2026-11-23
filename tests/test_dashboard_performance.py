@@ -846,34 +846,33 @@ def bench_15_proxy_redaction_and_sanitization() -> None:
 
 
 def bench_16_cheapest_click_failure_tolerance() -> None:
-    """Verify cheapest_tab.click() timeout returns cleanly without aborting the slot."""
+    """Verify cheapest_tab.click() timeout tries DOM click fallback and handles full failure gracefully."""
     def _click_fail_test() -> str:
-        class _DummyTab:
+        from src.scraper import consolidate_slot_offers
+
+        class _AlwaysFailTab:
             def count(self) -> int:
                 return 1
 
             def click(self, timeout: int = 5000) -> None:
                 raise TimeoutError("Locator.click: Timeout 5000ms exceeded")
 
-        class _DummyLocator:
-            def __init__(self) -> None:
-                self.first = _DummyTab()
+            def evaluate(self, script: str) -> None:
+                raise RuntimeError("DOM click blocked")
 
-            def filter(self, **kwargs: Any) -> "_DummyLocator":
+        class _FailLocator:
+            def __init__(self) -> None:
+                self.first = _AlwaysFailTab()
+
+            def filter(self, **kwargs: Any) -> "_FailLocator":
                 return self
 
-        class _DummyPage:
-            def locator(self, sel: str) -> _DummyLocator:
-                return _DummyLocator()
+        class _FailPage:
+            def locator(self, sel: str) -> _FailLocator:
+                return _FailLocator()
 
-            def get_by_role(self, role: str, **kwargs: Any) -> _DummyLocator:
-                return _DummyLocator()
-
-            def on(self, ev: str, fn: Any) -> None:
-                pass
-
-            def remove_listener(self, ev: str, fn: Any) -> None:
-                pass
+            def get_by_role(self, role: str, **kwargs: Any) -> _FailLocator:
+                return _FailLocator()
 
         sess = PooledPatchrightSession(proxy_url=None, headless=True)
         best_offers = [
@@ -887,13 +886,14 @@ def bench_16_cheapest_click_failure_tolerance() -> None:
                 tab_source="best",
             )
         ]
-        clicked, status = sess._switch_to_cheapest_tab_deterministic(
-            page=_DummyPage(),
+        clicked, status, tab_hint = sess._switch_to_cheapest_tab_deterministic(
+            page=_FailPage(),
             rpc_payload_counter={"count": 0},
             best_dom_offers=best_offers,
         )
         assert clicked is False
         assert status == "cheapest_click_timeout"
+        assert tab_hint is None
 
         # Consolidating with preserved Mejores/ds:1 data still yields valid slot result
         cons = consolidate_slot_offers(
@@ -906,7 +906,87 @@ def bench_16_cheapest_click_failure_tolerance() -> None:
         assert cons is not None
         assert cons["best_offer"].price == 15588.0
         assert cons["cheapest_offer"].price == 15588.0
-        return "cheapest_click_timeout preserves Mejores/ds:1 OK"
+
+        # Subcase B: locator.click() fails -> DOM el.click() fallback succeeds + spinner disappears + hint matches
+        dom_clicks = {"count": 0}
+
+        class _DomFallbackTab:
+            def count(self) -> int:
+                return 1
+
+            def click(self, timeout: int = 5000) -> None:
+                raise TimeoutError("Locator.click: Timeout 5000ms exceeded")
+
+            def evaluate(self, script: str) -> None:
+                dom_clicks["count"] += 1
+
+        class _FallbackLocator:
+            def __init__(self) -> None:
+                self.first = _DomFallbackTab()
+
+            def filter(self, **kwargs: Any) -> "_FallbackLocator":
+                return self
+
+        class _FallbackPage:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def locator(self, sel: str) -> _FallbackLocator:
+                return _FallbackLocator()
+
+            def get_by_role(self, role: str, **kwargs: Any) -> _FallbackLocator:
+                return _FallbackLocator()
+
+            def wait_for_timeout(self, ms: int) -> None:
+                pass
+
+            def evaluate(self, script: str, *args: Any) -> dict[str, Any]:
+                self.calls += 1
+                # Simulate real transition: call 1 provisional ($23,062 + spinner active) ->
+                # calls 2 & 3 spinner disappears and settled lowest price ($19,236) stabilizes
+                if self.calls == 1:
+                    return {
+                        "tabFound": True,
+                        "ariaSelected": True,
+                        "spinnerActive": True,
+                        "tabHintAria": "23062 pesos mexicanos",
+                        "tabHintText": "23.062\xa0MXN",
+                        "noCheaper": False,
+                        "cardSamples": [
+                            {
+                                "aria": "Desde 23062 pesos mexicanos. Salida de MEX.",
+                                "priceNodes": ["23.062\xa0MXN"],
+                                "lines": "23.062\xa0MXN",
+                            }
+                        ],
+                    }
+                return {
+                    "tabFound": True,
+                    "ariaSelected": True,
+                    "spinnerActive": False,
+                    "tabHintAria": "19236 pesos mexicanos",
+                    "tabHintText": "19.236\xa0MXN",
+                    "noCheaper": False,
+                    "cardSamples": [
+                        {
+                            "aria": "Desde 19236 pesos mexicanos. Salida de MEX.",
+                            "priceNodes": ["19.236\xa0MXN"],
+                            "lines": "19.236\xa0MXN",
+                        }
+                    ],
+                }
+
+        clicked2, status2, tab_hint2 = sess._switch_to_cheapest_tab_deterministic(
+            page=_FallbackPage(),
+            rpc_payload_counter={"count": 0},
+            best_dom_offers=best_offers,
+            expected_currency="MXN",
+        )
+        assert dom_clicks["count"] == 1
+        assert clicked2 is True
+        assert status2 == "cheapest_loaded_verified"
+        assert tab_hint2 == 19236.0
+        return "click fallback + Mejores preservation OK"
 
     measure("16. unit_cheapest_click_tolerance", _click_fail_test)
 
@@ -914,6 +994,8 @@ def bench_16_cheapest_click_failure_tolerance() -> None:
 def bench_17_min_offer_consolidation() -> None:
     """Verify consolidation picks min(dom_cheapest, rpc_cheapest, ds1_cheapest) and tags source."""
     def _min_test() -> str:
+        from src.scraper import consolidate_slot_offers
+
         best_dom = [FlightOffer(price=5393.0, airline="Aeromexico", origin_airport="MEX", destination_airport="GUA", tab_source="best")]
         cheapest_dom = [FlightOffer(price=5393.0, airline="Aeromexico", origin_airport="MEX", destination_airport="GUA", tab_source="cheapest")]
         rpc_offers = [FlightOffer(price=4100.0, airline="Volaris", origin_airport="MEX", destination_airport="GUA", tab_source="cheapest")]
@@ -939,6 +1021,51 @@ def bench_17_min_offer_consolidation() -> None:
         return "min(dom, rpc, ds1) consolidation + source tagging OK"
 
     measure("17. unit_min_offer_consolidation", _min_test)
+
+
+def bench_18_tab_hint_and_early_exit() -> None:
+    """Verify tab_hint parsing inside .bU1Yvc, spinner wait, early exit, and mismatch warning."""
+    def _hint_test() -> str:
+        from src.scraper import evaluate_cheapest_wait_state, parse_tab_hint_price
+
+        assert parse_tab_hint_price("19236 pesos mexicanos", "19.236\xa0MXN") == 19236.0
+        assert parse_tab_hint_price("", "23.062\xa0MXN") == 23062.0
+        assert parse_tab_hint_price("19829 pesos mexicanos", "") == 19829.0
+        assert parse_tab_hint_price("", "") is None
+
+        # Spinner active keeps waiting even when prices temporarily match
+        assert evaluate_cheapest_wait_state(True, True, 23062.0, 23062.0) == (False, "waiting")
+        # Tab not yet aria-selected keeps waiting (or cheapest_timeout at deadline)
+        assert evaluate_cheapest_wait_state(False, False, 19236.0, 19236.0) == (False, "waiting")
+        assert evaluate_cheapest_wait_state(False, False, 19236.0, 19236.0, at_deadline=True) == (True, "cheapest_timeout")
+        # Anti-premature-exit: provisional $23,062 at < 2.0s before spinner was seen must NOT exit early
+        assert evaluate_cheapest_wait_state(
+            True, False, 23062.0, 23062.0, spinner_seen=False, dom_hint_stable_count=1, elapsed_s=0.8
+        ) == (False, "waiting_min_settle")
+        # Even after spinner finishes, require 2 consecutive stable reads before cheapest_loaded_verified
+        assert evaluate_cheapest_wait_state(
+            True, False, 23062.0, 23062.0, spinner_seen=True, dom_hint_stable_count=1, elapsed_s=1.0
+        ) == (False, "waiting_hint_stability")
+        # Once spinner transitions to False and $19,236 stabilizes for 2 consecutive reads -> exit verified
+        assert evaluate_cheapest_wait_state(
+            True, False, 19236.0, 19236.0, spinner_seen=True, dom_hint_stable_count=2, elapsed_s=1.8
+        ) == (True, "cheapest_loaded_verified")
+        assert evaluate_cheapest_wait_state(
+            True, False, 19236.0, 19400.0, spinner_seen=True, dom_hint_stable_count=2, elapsed_s=2.0
+        ) == (True, "cheapest_loaded_verified")
+        # Still higher than hint before deadline -> wait
+        assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, at_deadline=False) == (False, "waiting_dom_sync")
+        # Persistent mismatch at deadline -> explicit mismatch status
+        assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, at_deadline=True) == (True, "cheapest_tab_mismatch")
+        # No-cheaper-options notice
+        assert evaluate_cheapest_wait_state(True, False, None, 26725.0, no_cheaper_notice=True) == (True, "cheapest_no_cheaper_notice")
+        # No hint fallback requires >= 2 consecutive stable DOM reads
+        assert evaluate_cheapest_wait_state(True, False, None, 19236.0, dom_stable_count=1) == (False, "waiting_dom_stability")
+        assert evaluate_cheapest_wait_state(True, False, None, 19236.0, dom_stable_count=2) == (True, "cheapest_dom_stabilized")
+
+        return "tab_hint parse + anti-premature-exit + mismatch OK"
+
+    measure("18. unit_tab_hint_and_early_exit", _hint_test)
 
 
 def print_summary_table() -> None:
@@ -972,6 +1099,7 @@ def main() -> int:
     bench_15_proxy_redaction_and_sanitization()
     bench_16_cheapest_click_failure_tolerance()
     bench_17_min_offer_consolidation()
+    bench_18_tab_hint_and_early_exit()
     print_summary_table()
     return 0
 
