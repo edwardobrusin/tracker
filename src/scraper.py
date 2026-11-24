@@ -81,6 +81,7 @@ class SlotScrapeResult:
     cheapest_tab_status: str = "not_checked"
     cheapest_source: str = "cheapest_dom"
     tab_hint_price: Optional[float] = None
+    sorted_by_price: bool = False
     raw_top_offers: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -153,7 +154,7 @@ def evaluate_cheapest_wait_state(
 ) -> tuple[bool, str]:
     """
     Decide whether the deterministic 'Los más bajos' wait loop can exit early,
-    must keep waiting for DOM synchronization, or timed out / mismatched.
+    must keep waiting for DOM synchronization, needs explicit Price sort, or timed out / mismatched.
     Prevents premature <2s exits on provisional prices when the spinner has not
     yet mounted/completed or before `tab_hint` + `dom_min` stabilize across 2 reads.
     Returns `(should_exit, status_reason)`.
@@ -178,6 +179,9 @@ def evaluate_cheapest_wait_state(
             return False, "waiting_hint_stability"
         if at_deadline:
             return True, "cheapest_tab_mismatch"
+        # Tab finished loading and cards settled under default "vuelos destacados" sort -> trigger Precio sort
+        if dom_stable_count >= 3:
+            return True, "cheapest_needs_price_sort"
         return False, "waiting_dom_sync"
 
     if dom_stable_count >= 2:
@@ -195,11 +199,12 @@ def consolidate_slot_offers(
     ds1_best: Optional[FlightOffer] = None,
     expected_origins: Optional[set[str]] = None,
     expected_destinations: Optional[set[str]] = None,
+    sorted_dom_offers: Optional[list[FlightOffer]] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Consolidate Best and Cheapest offers across DOM, GetShoppingResults RPC, and initial ds:1.
-    Always selects `min(dom_cheapest, rpc_cheapest, ds1_cheapest)` and records which source won
-    (`cheapest_dom`, `cheapest_rpc`, `cheapest_ds1_min`).
+    Consolidate Best and Cheapest offers across DOM, sorted-by-Price DOM, GetShoppingResults RPC,
+    and initial ds:1. Always selects `min(...)` and records which source won
+    (`cheapest_dom_sorted_price`, `cheapest_dom`, `cheapest_rpc`, `cheapest_ds1_min`).
     """
     best_offer: Optional[FlightOffer] = None
     if best_dom_offers:
@@ -208,6 +213,8 @@ def consolidate_slot_offers(
         best_offer = ds1_best
 
     tagged_candidates: list[tuple[FlightOffer, str]] = []
+    for offer in (sorted_dom_offers or []):
+        tagged_candidates.append((offer, "cheapest_dom_sorted_price"))
     for offer in cheapest_dom_offers:
         tagged_candidates.append((offer, "cheapest_dom"))
     for offer in rpc_offers:
@@ -220,16 +227,21 @@ def consolidate_slot_offers(
     if not tagged_candidates:
         return None
 
-    # Sort by price ASC; prefer DOM/RPC over ds1_min on exact tie
-    source_rank = {"cheapest_dom": 0, "cheapest_rpc": 1, "cheapest_ds1_min": 2}
-    tagged_candidates.sort(key=lambda pair: (pair[0].price, source_rank.get(pair[1], 3)))
+    # Sort by price ASC; prefer sorted-by-price DOM -> DOM -> RPC -> ds1_min on exact tie
+    source_rank = {
+        "cheapest_dom_sorted_price": 0,
+        "cheapest_dom": 1,
+        "cheapest_rpc": 2,
+        "cheapest_ds1_min": 3,
+    }
+    tagged_candidates.sort(key=lambda pair: (pair[0].price, source_rank.get(pair[1], 4)))
     cheapest_offer, cheapest_source = tagged_candidates[0]
 
     if best_offer is None:
         best_offer = cheapest_offer
 
-    if cheapest_source == "cheapest_dom" or best_dom_offers:
-        source_tag = "patchright_dom" if cheapest_source == "cheapest_dom" else (
+    if cheapest_source in ("cheapest_dom", "cheapest_dom_sorted_price") or best_dom_offers:
+        source_tag = "patchright_dom" if cheapest_source in ("cheapest_dom", "cheapest_dom_sorted_price") else (
             "patchright_rpc" if cheapest_source == "cheapest_rpc" else "patchright_ds1"
         )
     elif cheapest_source == "cheapest_rpc":
@@ -498,7 +510,9 @@ class PooledPatchrightSession:
         try:
             raw_cards = page.evaluate(
                 """(maxItems) => {
-                    const cards = Array.from(document.querySelectorAll('li.pIav2d')).slice(0, maxItems);
+                    const allCards = Array.from(document.querySelectorAll('li.pIav2d'));
+                    const visCards = allCards.filter(c => c.offsetParent !== null);
+                    const cards = (visCards.length ? visCards : allCards).slice(0, maxItems);
                     return cards.map(card => {
                         let aria = card.getAttribute('aria-label') || '';
                         if (!aria) {
@@ -646,12 +660,11 @@ class PooledPatchrightSession:
 
             # ------------------------------------------------------------------
             # LAYER 2A-PRE: Let the initial GetShoppingResults stream finish
-            # before clicking "Los más bajos", so low multi-carrier fares in
-            # initial full RPC / "Otros vuelos" DOM are never aborted mid-flight.
+            # before clicking "Los más bajos", preserving Best intact in the
+            # default ("Ordenados por vuelos destacados") order.
             # ------------------------------------------------------------------
-            pre_tab_hint_price = self._wait_for_initial_results_settle(page, max_wait_s=16.0)
+            pre_tab_hint_price = self._wait_for_initial_results_settle(page, max_wait_s=12.0)
 
-            # Extract top "Mejores opciones" cards + full pre-click DOM offers
             best_dom_offers = _filter_offers_for_corridor(
                 self._extract_dom_cards(
                     page, tab_source="best", max_cards=5, expected_currency=expected_curr
@@ -661,32 +674,11 @@ class PooledPatchrightSession:
             )
             pre_dom_offers = _filter_offers_for_corridor(
                 self._extract_dom_cards(
-                    page, tab_source="cheapest", max_cards=45, expected_currency=expected_curr
+                    page, tab_source="cheapest", max_cards=80, expected_currency=expected_curr
                 ),
                 expected_origins,
                 expected_destinations,
             )
-
-            # ------------------------------------------------------------------
-            # LAYER 2B: Deterministic Switch to Cheapest ("Los más bajos") Tab
-            # ------------------------------------------------------------------
-            cheapest_tab_clicked, cheapest_tab_status, post_tab_hint_price = self._switch_to_cheapest_tab_deterministic(
-                page=page,
-                rpc_payload_counter=rpc_payload_counter,
-                best_dom_offers=best_dom_offers,
-                expected_currency=expected_curr,
-            )
-            hint_candidates = [h for h in (pre_tab_hint_price, post_tab_hint_price) if h is not None and h > 0]
-            tab_hint_price = min(hint_candidates) if hint_candidates else None
-
-            cheapest_dom_offers = _filter_offers_for_corridor(
-                self._extract_dom_cards(
-                    page, tab_source="cheapest", max_cards=20, expected_currency=expected_curr
-                ),
-                expected_origins,
-                expected_destinations,
-            )
-            combined_cheapest_dom = [*cheapest_dom_offers, *pre_dom_offers]
             filtered_rpc_offers = _filter_offers_for_corridor(
                 rpc_cheapest_offers,
                 expected_origins,
@@ -703,8 +695,115 @@ class PooledPatchrightSession:
                     )
                     ds1_best = best_filtered[0] if best_filtered else None
 
+            pre_candidates = [*pre_dom_offers, *filtered_rpc_offers, *ds1_offers, *best_dom_offers]
+            pre_min_price = min((o.price for o in pre_candidates if o.price > 0), default=None)
+
+            cheapest_dom_offers: list[FlightOffer] = []
+            sorted_dom_offers: list[FlightOffer] = []
+            sorted_by_price = False
+
+            # PRE Speed Shortcut: skip "Los más bajos" tab click if PRE already matched pre_tab_hint
+            if (
+                pre_tab_hint_price is not None
+                and pre_tab_hint_price > 0
+                and pre_min_price is not None
+                and pre_min_price > 0
+                and pre_min_price <= pre_tab_hint_price * 1.01
+            ):
+                cheapest_tab_status = "cheapest_matched_in_pre"
+                tab_hint_price = pre_tab_hint_price
+                logger.info(
+                    "PRE speed shortcut: status=cheapest_matched_in_pre (pre_min=$%s, pre_hint=$%s)",
+                    f"{pre_min_price:,.0f}",
+                    f"{pre_tab_hint_price:,.0f}",
+                )
+            else:
+                # ------------------------------------------------------------------
+                # LAYER 2B: Deterministic "Los más bajos" + optional Sort by Precio
+                # Hard budget <= 23.0s total across click + wait + sort by price
+                # ------------------------------------------------------------------
+                phase_start = time.perf_counter()
+                phase_deadline = phase_start + 22.0
+
+                cheapest_tab_clicked, cheapest_tab_status, post_tab_hint_price = self._switch_to_cheapest_tab_deterministic(
+                    page=page,
+                    rpc_payload_counter=rpc_payload_counter,
+                    best_dom_offers=best_dom_offers,
+                    expected_currency=expected_curr,
+                    hard_timeout_s=14.5,
+                )
+                hint_candidates = [h for h in (pre_tab_hint_price, post_tab_hint_price) if h is not None and h > 0]
+                tab_hint_price = min(hint_candidates) if hint_candidates else None
+
+                cheapest_dom_offers = _filter_offers_for_corridor(
+                    self._extract_dom_cards(
+                        page, tab_source="cheapest", max_cards=80, expected_currency=expected_curr
+                    ),
+                    expected_origins,
+                    expected_destinations,
+                )
+                filtered_rpc_offers = _filter_offers_for_corridor(
+                    rpc_cheapest_offers,
+                    expected_origins,
+                    expected_destinations,
+                )
+
+                current_candidates = [*cheapest_dom_offers, *pre_dom_offers, *filtered_rpc_offers, *ds1_offers]
+                current_min = min((o.price for o in current_candidates if o.price > 0), default=None)
+                needs_price_sort = (
+                    cheapest_tab_clicked
+                    and (
+                        cheapest_tab_status in ("cheapest_needs_price_sort", "cheapest_tab_mismatch", "cheapest_timeout")
+                        or (
+                            tab_hint_price is not None
+                            and tab_hint_price > 0
+                            and (current_min is None or current_min > tab_hint_price * 1.01)
+                        )
+                    )
+                )
+
+                if needs_price_sort:
+                    rem_budget = phase_deadline - time.perf_counter()
+                    sort_budget = max(3.5, min(5.0, rem_budget))
+                    sorted_applied, sort_hint, sort_dom_min = self._sort_results_by_price(
+                        page=page,
+                        tab_hint_price=tab_hint_price,
+                        max_wait_s=sort_budget,
+                    )
+                    if sort_hint is not None and sort_hint > 0:
+                        tab_hint_price = min(tab_hint_price, sort_hint) if tab_hint_price else sort_hint
+                    if sorted_applied:
+                        sorted_by_price = True
+                        sorted_dom_offers = _filter_offers_for_corridor(
+                            self._extract_dom_cards(
+                                page, tab_source="cheapest", max_cards=80, expected_currency=expected_curr
+                            ),
+                            expected_origins,
+                            expected_destinations,
+                        )
+                        filtered_rpc_offers = _filter_offers_for_corridor(
+                            rpc_cheapest_offers,
+                            expected_origins,
+                            expected_destinations,
+                        )
+                        sorted_min = min(
+                            (o.price for o in [*sorted_dom_offers, *filtered_rpc_offers] if o.price > 0),
+                            default=sort_dom_min,
+                        )
+                        if (
+                            tab_hint_price is not None
+                            and tab_hint_price > 0
+                            and sorted_min is not None
+                            and sorted_min <= tab_hint_price * 1.01
+                        ):
+                            cheapest_tab_status = "cheapest_sorted_price_verified"
+                        elif sorted_min is not None and sorted_min > 0:
+                            cheapest_tab_status = "cheapest_sorted_price"
+
+            combined_cheapest_dom = [*cheapest_dom_offers, *pre_dom_offers]
+
             # ------------------------------------------------------------------
-            # MERGE & SELECT BEST + MIN(DOM, RPC, DS:1) CHEAPEST OFFERS
+            # MERGE & SELECT BEST + MIN(SORTED_DOM, DOM, RPC, DS:1) CHEAPEST
             # ------------------------------------------------------------------
             consolidated = consolidate_slot_offers(
                 best_dom_offers=best_dom_offers,
@@ -714,6 +813,7 @@ class PooledPatchrightSession:
                 ds1_best=ds1_best,
                 expected_origins=expected_origins,
                 expected_destinations=expected_destinations,
+                sorted_dom_offers=sorted_dom_offers,
             )
             if not consolidated:
                 return None
@@ -740,6 +840,7 @@ class PooledPatchrightSession:
                 cheapest_tab_status=cheapest_tab_status,
                 cheapest_source=consolidated["cheapest_source"],
                 tab_hint_price=tab_hint_price,
+                sorted_by_price=sorted_by_price,
                 raw_top_offers=consolidated["top_3_dicts"],
             )
         finally:
@@ -810,11 +911,11 @@ class PooledPatchrightSession:
                         bodyLower.includes('no cheaper flights')
                     );
 
-                    const cards = Array.from(document.querySelectorAll('li.pIav2d')).slice(0, 8);
-                    const cardSamples = cards.map(c => {
+                    const cards = Array.from(document.querySelectorAll('li.pIav2d'));
+                    const cardSamples = cards.map((c, idx) => {
                         const aria = c.getAttribute('aria-label') || (c.querySelector('[aria-label]')?.getAttribute('aria-label') || '');
-                        const priceNodes = Array.from(c.querySelectorAll('.YMlIz, span[data-gs]')).map(n => (n.innerText || '').trim()).filter(Boolean);
-                        const lines = (c.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean).slice(0, 4).join('|');
+                        const priceNodes = Array.from(c.querySelectorAll('.YMlIz, span[data-gs]')).map(n => (n.textContent || '').trim()).filter(Boolean);
+                        const lines = idx < 6 ? (c.textContent || '').split('\\n').map(s => s.trim()).filter(Boolean).slice(0, 4).join('|') : '';
                         return { aria, priceNodes, lines };
                     });
 
@@ -878,21 +979,166 @@ class PooledPatchrightSession:
             page.wait_for_timeout(400)
         return last_pre_hint
 
+    def _sort_results_by_price(
+        self,
+        page: Any,
+        tab_hint_price: Optional[float] = None,
+        max_wait_s: float = 5.0,
+    ) -> tuple[bool, Optional[float], Optional[float]]:
+        """
+        Explicitly switch the Google Flights sort dropdown (`button[jsname="AefGQb"]`,
+        usually defaulting to "Ordenados por vuelos destacados") to "Precio" / "Price",
+        poll briefly (300 ms, capped at `max_wait_s`) until `dom_min <= tab_hint * 1.01`
+        or 2 stable reads of the top card, and return `(sorted_applied, tab_hint, dom_min)`.
+        """
+        t0 = time.perf_counter()
+        deadline = t0 + max(1.0, max_wait_s)
+
+        try:
+            sort_btn = page.locator('button[jsname="AefGQb"]:visible').first
+            if sort_btn.count() == 0:
+                sort_btn = page.locator('button[aria-label*="Ordenados por"]:visible, button[aria-label*="Sorted by"]:visible').first
+            if sort_btn.count() == 0:
+                sort_btn = page.locator('button[jsname="AefGQb"]').first
+            if sort_btn.count() == 0:
+                sort_btn = page.locator('button[aria-label*="Ordenados por"], button[aria-label*="Sorted by"]').first
+            if sort_btn.count() == 0:
+                logger.debug("Sort-by-price button not found; skipping sort fallback.")
+                return False, tab_hint_price, None
+        except Exception as btn_exc:
+            logger.debug("Sort-by-price locate failed (%s).", sanitize_log_text(btn_exc))
+            return False, tab_hint_price, None
+
+        # Open dropdown menu with click() -> DOM el.click() fallback
+        try:
+            sort_btn.click(timeout=2000)
+        except Exception:
+            try:
+                sort_btn.evaluate("el => el.click()")
+            except Exception as open_exc:
+                logger.debug("Sort-by-price button click failed (%s).", sanitize_log_text(open_exc))
+                return False, tab_hint_price, None
+
+        page.wait_for_timeout(250)
+
+        # Select "Precio" / "Price" from menu
+        price_opt_re = re.compile(r"^\s*(Precio|Price)\s*$", re.I)
+        option_clicked = False
+        try:
+            opt_loc = page.locator(
+                '[role="menuitemradio"]:visible, [role="option"]:visible, [role="menuitem"]:visible, li:visible'
+            ).filter(has_text=price_opt_re).first
+            if opt_loc.count() == 0:
+                opt_loc = page.locator('[role="menuitemradio"], [role="option"], [role="menuitem"], li').filter(
+                    has_text=price_opt_re
+                ).first
+            if opt_loc.count() > 0:
+                try:
+                    opt_loc.click(timeout=2000)
+                    option_clicked = True
+                except Exception:
+                    opt_loc.evaluate("el => el.click()")
+                    option_clicked = True
+        except Exception:
+            pass
+
+        if not option_clicked:
+            try:
+                option_clicked = bool(
+                    page.evaluate(
+                        """() => {
+                            const items = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="option"], [role="menuitem"], li'));
+                            const re = /^\\s*(Precio|Price)\\s*$/i;
+                            const target = items.find(el => re.test((el.innerText || el.textContent || '').trim()));
+                            if (!target) return false;
+                            target.click();
+                            return true;
+                        }"""
+                    )
+                )
+            except Exception:
+                option_clicked = False
+
+        if not option_clicked:
+            logger.debug("Could not select 'Precio'/'Price' option inside sort dropdown.")
+            return False, tab_hint_price, None
+
+        # Poll briefly for sorted top cards / tab_hint convergence
+        last_hint = tab_hint_price
+        last_dom_min: Optional[float] = None
+        prev_top_sig: Optional[tuple[Optional[float], str]] = None
+        stable_count = 0
+
+        while True:
+            st = self._probe_cheapest_dom_state(page)
+            spinner_active = bool(st.get("spinnerActive"))
+            hint_now = parse_tab_hint_price(st.get("tabHintAria", ""), st.get("tabHintText", ""))
+            if hint_now is not None and hint_now > 0:
+                last_hint = min(last_hint, hint_now) if last_hint else hint_now
+
+            parsed_prices: list[float] = []
+            top_line = ""
+            for idx, cs in enumerate(st.get("cardSamples") or []):
+                p_val: Optional[float] = None
+                for p_txt in cs.get("priceNodes") or []:
+                    cand = parse_price_number(p_txt)
+                    if cand is not None:
+                        p_val = cand
+                        break
+                if p_val is None and cs.get("aria"):
+                    p_val = parse_price_number(cs["aria"])
+                if p_val is not None and p_val > 0:
+                    parsed_prices.append(p_val)
+                if idx == 0:
+                    top_line = f"{p_val or ''}|{cs.get('lines', '')}"
+
+            dom_min_now = min(parsed_prices) if parsed_prices else None
+            last_dom_min = dom_min_now
+
+            if not spinner_active and dom_min_now is not None:
+                if last_hint is not None and last_hint > 0 and dom_min_now <= last_hint * 1.01:
+                    break
+                sig_now = (dom_min_now, top_line)
+                if sig_now == prev_top_sig:
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                prev_top_sig = sig_now
+                if stable_count >= 2 and (time.perf_counter() - t0) >= 0.6:
+                    break
+            else:
+                stable_count = 0
+                prev_top_sig = None
+
+            if time.perf_counter() >= deadline:
+                break
+            page.wait_for_timeout(300)
+
+        logger.info(
+            "Applied sort by Precio: sorted_by_price=True (%.2fs, tab_hint=%s, dom_min=%s)",
+            time.perf_counter() - t0,
+            f"${last_hint:,.0f}" if last_hint is not None else "N/A",
+            f"${last_dom_min:,.0f}" if last_dom_min is not None else "N/A",
+        )
+        return True, last_hint, last_dom_min
+
     def _switch_to_cheapest_tab_deterministic(
         self,
         page: Any,
         rpc_payload_counter: dict[str, int],
         best_dom_offers: list[FlightOffer],
         expected_currency: Optional[str] = None,
-        hard_timeout_s: float = 25.0,
+        hard_timeout_s: float = 14.5,
     ) -> tuple[bool, str, Optional[float]]:
         """
         Deterministically switch from 'Mejores opciones' to 'Los más bajos' / 'Cheapest':
-          1. Try `cheapest_tab.click(timeout=5000)` with immediate DOM `el.click()` fallback.
-          2. Poll every 400 ms (hard deadline 25s) via single `page.evaluate(...)` reading:
-             `ariaSelected`, `.bU1Yvc` spinner presence, `tab_hint_price`, and `dom_min_price`.
+          1. Try `cheapest_tab.click(timeout=3500)` with immediate DOM `el.click()` fallback.
+          2. Poll every 400 ms (hard deadline `hard_timeout_s`, leaving budget for Price sort)
+             via single `page.evaluate(...)` reading `ariaSelected`, `.bU1Yvc` spinner, `tab_hint_price`,
+             and `dom_min_price` across ALL `li.pIav2d` cards.
           3. Require `spinner_seen` (or >= 2.0 s settle) AND 2 consecutive stable readings
-             where `dom_min_price <= tab_hint_price * 1.01` before early exit.
+             where `dom_min_price <= tab_hint_price * 1.01` before early exit; exit cleanly to
+             trigger `_sort_results_by_price()` if tab settled with `dom_min > tab_hint * 1.01`.
         """
         t0 = time.perf_counter()
         hard_deadline = t0 + hard_timeout_s
@@ -918,10 +1164,10 @@ class PooledPatchrightSession:
 
         rpc_before = rpc_payload_counter.get("count", 0)
 
-        # Primary click with immediate DOM click() fallback
+        # Primary click (capped at 3500ms) with immediate DOM click() fallback
         clicked_ok = False
         try:
-            cheapest_tab.click(timeout=5000)
+            cheapest_tab.click(timeout=3500)
             clicked_ok = True
         except Exception as click_exc:
             logger.warning(
@@ -1021,6 +1267,10 @@ class PooledPatchrightSession:
                 prev_hint_dom_pair = None
 
             elapsed_now = time.perf_counter() - t0
+            if not dom_state.get("tabFound") and elapsed_now >= 4.5:
+                final_status = "cheapest_tab_missing"
+                break
+
             at_deadline = time.perf_counter() >= hard_deadline
             should_exit, status_reason = evaluate_cheapest_wait_state(
                 aria_selected=aria_selected,
@@ -1512,11 +1762,12 @@ def scrape_date_slot(
                 if browser_result and browser_result.cheapest_tab_price > 0:
                     elapsed = time.perf_counter() - start_ts
                     logger.info(
-                        "%sScraped slot via %s (%s | tab_status=%s) in %.2fs -> Cheapest: $%s (%s) | Best: $%s | tab_hint=%s",
+                        "%sScraped slot via %s (%s | tab_status=%s | sorted_by_price=%s) in %.2fs -> Cheapest: $%s (%s) | Best: $%s | tab_hint=%s",
                         slot_tag,
                         browser_result.extraction_source,
                         browser_result.cheapest_source,
                         browser_result.cheapest_tab_status or "N/A",
+                        browser_result.sorted_by_price,
                         elapsed,
                         f"{browser_result.cheapest_tab_price:,.0f}",
                         browser_result.cheapest_airline,

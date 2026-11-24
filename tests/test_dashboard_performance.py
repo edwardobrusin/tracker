@@ -1053,8 +1053,9 @@ def bench_18_tab_hint_and_early_exit() -> None:
         assert evaluate_cheapest_wait_state(
             True, False, 19236.0, 19400.0, spinner_seen=True, dom_hint_stable_count=2, elapsed_s=2.0
         ) == (True, "cheapest_loaded_verified")
-        # Still higher than hint before deadline -> wait
-        assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, at_deadline=False) == (False, "waiting_dom_sync")
+        # Still higher than hint before deadline -> wait, then request sort when DOM stabilizes
+        assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, dom_stable_count=1, at_deadline=False) == (False, "waiting_dom_sync")
+        assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, dom_stable_count=3, at_deadline=False) == (True, "cheapest_needs_price_sort")
         # Persistent mismatch at deadline -> explicit mismatch status
         assert evaluate_cheapest_wait_state(True, False, 19236.0, 26725.0, at_deadline=True) == (True, "cheapest_tab_mismatch")
         # No-cheaper-options notice
@@ -1066,6 +1067,201 @@ def bench_18_tab_hint_and_early_exit() -> None:
         return "tab_hint parse + anti-premature-exit + mismatch OK"
 
     measure("18. unit_tab_hint_and_early_exit", _hint_test)
+
+
+def bench_19_pre_shortcut_skips_switch() -> None:
+    """Verify PRE speed shortcut skips _switch_to_cheapest_tab_deterministic when pre_min <= pre_hint * 1.01."""
+    def _shortcut_test() -> str:
+        from src.tfs_builder import build_google_flights_url
+
+        class _StubPage:
+            url = "https://www.google.com/travel/flights/search"
+
+            def set_default_timeout(self, ms: int) -> None:
+                pass
+
+            def on(self, ev: str, fn: Any) -> None:
+                pass
+
+            def goto(self, u: str, **kwargs: Any) -> None:
+                pass
+
+            def wait_for_selector(self, sel: str, **kwargs: Any) -> None:
+                pass
+
+            def content(self) -> str:
+                return "<html><body></body></html>"
+
+            def close(self) -> None:
+                pass
+
+        class _StubCtx:
+            def new_page(self) -> _StubPage:
+                return _StubPage()
+
+        sess = PooledPatchrightSession(proxy_url=None, headless=True)
+        sess._context = _StubCtx()
+
+        best_offer = FlightOffer(
+            price=20594.0,
+            airline="British Airways",
+            stops="1 escala",
+            duration="16 h 10 min",
+            dep_arr="10:00 - 14:00 (MEX-OSL)",
+            origin_airport="MEX",
+            destination_airport="OSL",
+            tab_source="best",
+        )
+        cheapest_pre_offer = FlightOffer(
+            price=19236.0,
+            airline="American, Finnair, British Airways",
+            stops="2 escalas",
+            duration="24 h 10 min",
+            dep_arr="08:00 - 15:00 (MEX-OSL)",
+            origin_airport="MEX",
+            destination_airport="OSL",
+            tab_source="cheapest",
+        )
+
+        sess._wait_for_initial_results_settle = lambda page, max_wait_s=16.0: 19236.0  # type: ignore[method-assign]
+        sess._extract_dom_cards = lambda page, tab_source="best", max_cards=5, expected_currency=None: (  # type: ignore[method-assign]
+            [best_offer] if tab_source == "best" else [best_offer, cheapest_pre_offer]
+        )
+
+        switch_calls = {"count": 0}
+        sort_calls = {"count": 0}
+
+        def _fail_if_switch(*args: Any, **kwargs: Any) -> tuple[bool, str, Optional[float]]:
+            switch_calls["count"] += 1
+            return True, "cheapest_loaded_verified", 19236.0
+
+        def _fail_if_sort(*args: Any, **kwargs: Any) -> tuple[bool, Optional[float], Optional[float]]:
+            sort_calls["count"] += 1
+            return False, None, None
+
+        sess._switch_to_cheapest_tab_deterministic = _fail_if_switch  # type: ignore[method-assign]
+        sess._sort_results_by_price = _fail_if_sort  # type: ignore[method-assign]
+
+        test_url = build_google_flights_url(["MEX"], ["TOS", "OSL"], "2027-09-18", "2027-10-04")
+        res = sess._scrape_slot_once(test_url)
+        assert res is not None
+        assert switch_calls["count"] == 0, f"Expected 0 tab switch calls, got {switch_calls['count']}"
+        assert sort_calls["count"] == 0, f"Expected 0 sort calls, got {sort_calls['count']}"
+        assert res.cheapest_tab_status == "cheapest_matched_in_pre"
+        assert res.cheapest_tab_price == 19236.0
+        assert res.best_tab_price == 20594.0
+        assert res.tab_hint_price == 19236.0
+        assert res.sorted_by_price is False
+        return "cheapest_matched_in_pre skips click + preserves Best OK"
+
+    measure("19. unit_pre_shortcut_skips_switch", _shortcut_test)
+
+
+def bench_20_sort_results_by_price() -> None:
+    """Verify _sort_results_by_price clicks button[jsname='AefGQb'] -> Precio and consolidates 43h20m $16,205 offer."""
+    def _sort_test() -> str:
+        from src.ds1_parser import parse_flight_card_text
+        from src.scraper import consolidate_slot_offers
+
+        clicks = {"open_menu": 0, "select_precio": 0}
+
+        class _SortBtn:
+            def count(self) -> int:
+                return 1
+
+            def click(self, timeout: int = 2000) -> None:
+                clicks["open_menu"] += 1
+
+        class _PrecioOption:
+            def count(self) -> int:
+                return 1
+
+            def click(self, timeout: int = 2000) -> None:
+                clicks["select_precio"] += 1
+
+        class _MockLocator:
+            def __init__(self, target_kind: str) -> None:
+                self.target_kind = target_kind
+                self.first = _SortBtn() if target_kind == "sort_btn" else _PrecioOption()
+
+            def filter(self, **kwargs: Any) -> "_MockLocator":
+                return self
+
+        class _SortMockPage:
+            def locator(self, sel: str) -> _MockLocator:
+                if "AefGQb" in sel:
+                    return _MockLocator("sort_btn")
+                return _MockLocator("menu_opt")
+
+            def wait_for_timeout(self, ms: int) -> None:
+                pass
+
+            def evaluate(self, script: str, *args: Any) -> Any:
+                # Probe state after selecting "Precio"
+                if clicks["select_precio"] > 0:
+                    return {
+                        "tabFound": True,
+                        "ariaSelected": True,
+                        "spinnerActive": False,
+                        "tabHintAria": "16205 pesos mexicanos",
+                        "tabHintText": "16.205\xa0MXN",
+                        "noCheaper": False,
+                        "cardSamples": [
+                            {
+                                "aria": "Desde 16205 pesos mexicanos. Air Canada. 2 escalas. 43 h 20 min.",
+                                "priceNodes": ["16.205\xa0MXN"],
+                                "lines": "16.205\xa0MXN|Air Canada|43 h 20 min|2 escalas",
+                            }
+                        ],
+                    }
+                return {}
+
+        sess = PooledPatchrightSession(proxy_url=None, headless=True)
+        applied, sort_hint, sort_min = sess._sort_results_by_price(
+            page=_SortMockPage(),
+            tab_hint_price=16205.0,
+            max_wait_s=2.0,
+        )
+        assert clicks["open_menu"] == 1
+        assert clicks["select_precio"] == 1
+        assert applied is True
+        assert sort_hint == 16205.0
+        assert sort_min == 16205.0
+
+        # Parse the real long-duration 43 h 20 min card without any duration/stops truncation
+        parsed = parse_flight_card_text(
+            aria_label=(
+                "Desde 16205 pesos mexicanos por viaje de ida y vuelta con Air Canada. "
+                "Sale del aeropuerto de MEX a las 06:15 y llega a MAD a las 01:35. "
+                "Duración total: 43 h 20 min. 2 escalas."
+            ),
+            inner_text="06:15 – 01:35\nAir Canada\n43 h 20 min\nMEX–MAD\n2 escalas\n16.205\xa0MXN",
+            price_override=16205.0,
+            tab_source="cheapest",
+            expected_currency="MXN",
+        )
+        assert parsed is not None
+        assert parsed.price == 16205.0
+        assert parsed.airline == "Air Canada"
+        assert parsed.stops == "2 escalas"
+        assert parsed.duration == "43 h 20 min"
+
+        best_default = [FlightOffer(price=19480.0, airline="Iberia", stops="Directo", duration="10 h 35 min", origin_airport="MEX", destination_airport="MAD", tab_source="best")]
+        cons = consolidate_slot_offers(
+            best_dom_offers=best_default,
+            cheapest_dom_offers=[FlightOffer(price=18500.0, airline="Aeromexico", origin_airport="MEX", destination_airport="MAD", tab_source="cheapest")],
+            rpc_offers=[],
+            ds1_offers=[],
+            ds1_best=best_default[0],
+            sorted_dom_offers=[parsed],
+        )
+        assert cons is not None
+        assert cons["cheapest_offer"].price == 16205.0
+        assert cons["cheapest_source"] == "cheapest_dom_sorted_price"
+        assert cons["best_offer"].price == 19480.0
+        return "sort button AefGQb -> Precio -> $16,205 (43h20m) OK"
+
+    measure("20. unit_sort_results_by_price", _sort_test)
 
 
 def print_summary_table() -> None:
@@ -1100,6 +1296,8 @@ def main() -> int:
     bench_16_cheapest_click_failure_tolerance()
     bench_17_min_offer_consolidation()
     bench_18_tab_hint_and_early_exit()
+    bench_19_pre_shortcut_skips_switch()
+    bench_20_sort_results_by_price()
     print_summary_table()
     return 0
 
