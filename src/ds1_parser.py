@@ -497,9 +497,9 @@ PRICE_PATTERNS = (
         r"(?:MX\$|US\$|\$|EUR|€)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
         re.IGNORECASE,
     ),
-    # Explicit currency suffix (14,520 MXN, 31.295 MXN, 14520 pesos)
+    # Explicit currency suffix (14,520 MXN, 31.295 MXN, 14520 pesos, 15959 Mexican pesos)
     re.compile(
-        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|COP|CAD|pesos|dólares)",
+        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|COP|CAD|(?:mexican\s+)?pesos(?:\s+mexicanos)?|dólares|dollars)",
         re.IGNORECASE,
     ),
     # Formatted thousands with comma or dot (31.295, 14,520) not followed by non-price units

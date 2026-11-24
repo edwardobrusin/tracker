@@ -34,6 +34,7 @@ else:
 
 from src.config import (
     DEFAULT_CURRENCY,
+    DEFAULT_GL,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     get_flight_window_status,
@@ -44,7 +45,7 @@ from src.db import (
     list_destinations,
     record_alert_and_update_slots,
 )
-from src.tfs_builder import format_date_slot_label
+from src.tfs_builder import CHEAPEST_TFU, format_date_slot_label, normalize_flights_url
 
 logger = logging.getLogger("flightpulse.alerts")
 
@@ -314,7 +315,12 @@ def format_consolidated_destination_digest(
             lines.append(f"Mejor: ${float(b_price):,.0f} {currency} ({b_route}{b_stops}, {b_dur})")
 
         raw_url = str(slot.get("google_flights_url") or "https://www.google.com/travel/flights").strip()
-        escaped_url = html.escape(raw_url, quote=True)
+        dest_gl = str(destination_meta.get("gl") or DEFAULT_GL).strip().upper()
+        try:
+            booking_url = normalize_flights_url(raw_url, tfu=CHEAPEST_TFU, gl=dest_gl)
+        except Exception:
+            booking_url = raw_url
+        escaped_url = html.escape(booking_url, quote=True)
         lines.append(f'<a href="{escaped_url}"><b>[Reservar]</b></a>')
 
         if idx < len(sorted_slots):
@@ -447,6 +453,7 @@ def send_test_digest_alert(destination_id: Optional[int] = None) -> tuple[bool, 
             "origin": "MEX",
             "destination": "MAD",
             "currency": "MXN",
+            "gl": DEFAULT_GL,
             "target_price": 15500.0,
         }
 

@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 
 from src.alerts import dispatch_destination_digest, evaluate_slot_alert_triggers
 from src.config import (
+    DEFAULT_GL,
     MAX_SLOTS_PER_RUN,
     get_proxy_account,
     get_proxy_pool,
@@ -166,6 +167,7 @@ def run_sharded_dispatcher(
                 "origin": slot.get("origin"),
                 "destination": slot.get("destination_code"),
                 "currency": slot.get("currency"),
+                "gl": str(slot.get("gl") or DEFAULT_GL).strip().upper(),
                 "target_price": slot.get("target_price"),
                 "cooldown_hours": slot.get("cooldown_hours"),
                 "filter_config": slot.get("filter_config") or {},
@@ -272,6 +274,7 @@ def run_sharded_dispatcher(
                         pooled_session=session,
                         proxy_url=current_channel,
                         date_range_label=date_range_label,
+                        gl=dest_meta.get("gl"),
                     )
                     if session is not None and session.proxy_url != current_channel:
                         # Session switched in-place (e.g. proxy -> direct)
@@ -314,6 +317,7 @@ def run_sharded_dispatcher(
                                 pooled_session=session,
                                 proxy_url=current_channel,
                                 date_range_label=date_range_label,
+                                gl=dest_meta.get("gl"),
                             )
                             used_channel = session.proxy_url if session is not None else current_channel
                         except Exception as esc_exc:

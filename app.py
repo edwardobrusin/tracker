@@ -990,7 +990,7 @@ def render_tab2_destination_and_generator() -> None:
                 key=f"dest_trip_{key_suffix}",
             )
 
-        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1.1, 0.9, 1.0, 1.0, 1.0])
+        r2c1, r2c2, r2c3, r2c4, r2c5, r2c6 = st.columns([1.05, 0.8, 0.85, 0.95, 0.95, 1.0])
         with r2c1:
             target_price_val = st.number_input(
                 "Precio meta",
@@ -1010,6 +1010,18 @@ def render_tab2_destination_and_generator() -> None:
                 key=f"dest_curr_{key_suffix}",
             )
         with r2c3:
+            gl_options = ["MX", "IT", "ES", "DE", "US"]
+            curr_gl = str(existing_dest.get("gl") or DEFAULT_GL).strip().upper() if existing_dest else DEFAULT_GL
+            if curr_gl not in gl_options:
+                gl_options.append(curr_gl)
+            gl_val = st.selectbox(
+                "Mercado / POS (gl)",
+                options=gl_options,
+                index=gl_options.index(curr_gl) if curr_gl in gl_options else 0,
+                help="Mercado Google Flights (gl): usa IT para hubs europeos o MX por defecto.",
+                key=f"dest_gl_{key_suffix}",
+            )
+        with r2c4:
             cabins = ["economy", "premium-economy", "business", "first"]
             seat_val = st.selectbox(
                 "Cabina",
@@ -1023,7 +1035,7 @@ def render_tab2_destination_and_generator() -> None:
                 }[s],
                 key=f"dest_seat_{key_suffix}",
             )
-        with r2c4:
+        with r2c5:
             interval_choices = [60, 180, 240, 360]
             curr_interval = (
                 int(existing_dest.get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES))
@@ -1042,7 +1054,7 @@ def render_tab2_destination_and_generator() -> None:
                 format_func=lambda m: f"Cada {m // 60}h",
                 key=f"dest_interval_{key_suffix}",
             )
-        with r2c5:
+        with r2c6:
             cooldown_choices = [6, 12, 24]
             curr_cd = int(existing_dest.get("cooldown_hours", 12)) if existing_dest else 12
             cooldown_val = st.selectbox(
@@ -1195,7 +1207,7 @@ def render_tab2_destination_and_generator() -> None:
                                 target_price=float(target_price_val),
                                 trip_type=trip_type_val,
                                 currency=currency_val,
-                                gl=DEFAULT_GL,
+                                gl=gl_val,
                                 hl=DEFAULT_HL,
                                 check_interval_minutes=int(check_interval_val),
                                 cooldown_hours=int(cooldown_val),
@@ -1217,7 +1229,7 @@ def render_tab2_destination_and_generator() -> None:
                                 target_price=float(target_price_val),
                                 trip_type=trip_type_val,
                                 currency=currency_val,
-                                gl=DEFAULT_GL,
+                                gl=gl_val,
                                 hl=DEFAULT_HL,
                                 check_interval_minutes=int(check_interval_val),
                                 cooldown_hours=int(cooldown_val),

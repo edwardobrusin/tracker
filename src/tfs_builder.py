@@ -26,6 +26,8 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from src.config import DEFAULT_CURRENCY, DEFAULT_GL, DEFAULT_HL, MAX_SLOTS_PER_DESTINATION
 
 __all__ = [
+    "BEST_TFU",
+    "CHEAPEST_TFU",
     "FilterProfile",
     "METRO_IATA_EXPANSION_MAP",
     "parse_iata_list",
@@ -34,11 +36,15 @@ __all__ = [
     "encode_tfs_protobuf",
     "build_google_flights_url",
     "decode_tfs_parameter",
+    "normalize_flights_url",
     "normalize_google_flights_url",
     "format_date_slot_label",
     "parse_pasted_urls",
     "generate_date_matrix",
 ]
+
+BEST_TFU: str = "EgQIABABIgA"
+CHEAPEST_TFU: str = "EgoIABAAGAAgAigB"
 
 logger = logging.getLogger("flightpulse.tfs_builder")
 
@@ -471,7 +477,7 @@ def build_google_flights_url(
         "curr": (curr or DEFAULT_CURRENCY).strip().upper(),
         "gl": (gl or DEFAULT_GL).strip().upper(),
         "hl": (hl or DEFAULT_HL).strip().lower(),
-        "tfu": "EgQIABABIgA",
+        "tfu": BEST_TFU,
     }
     return f"https://www.google.com/travel/flights/search?{urlencode(query_params)}"
 
@@ -713,6 +719,40 @@ def normalize_google_flights_url(
         )
     )
     return normalized
+
+
+def normalize_flights_url(
+    url: str,
+    *,
+    tfu: str = CHEAPEST_TFU,
+    gl: Optional[str] = None,
+) -> str:
+    """
+    Safely insert or update `tfu` (defaulting to direct Cheapest view `CHEAPEST_TFU`)
+    and optionally `gl` in any Google Flights URL without altering `?tfs=`, `curr`, or `hl`.
+    """
+    if not url or not str(url).strip():
+        raise ValueError("URL cannot be empty")
+
+    raw = str(url).strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+
+    parsed = urlparse(raw)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    flat_params: dict[str, str] = {}
+    for k, v_list in qs.items():
+        if v_list:
+            flat_params[k] = v_list[0]
+
+    flat_params["tfu"] = (tfu or CHEAPEST_TFU).strip()
+    if gl is not None and str(gl).strip():
+        flat_params["gl"] = str(gl).strip().upper()
+
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or "www.google.com"
+    path = parsed.path or "/travel/flights/search"
+    return urlunparse((scheme, netloc, path, parsed.params, urlencode(flat_params), parsed.fragment))
 
 
 def format_date_slot_label(outbound_date: str, return_date: Optional[str] = None) -> str:
