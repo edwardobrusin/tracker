@@ -21,10 +21,11 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import random
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 try:
@@ -38,11 +39,13 @@ from src.config import (
     CHEAPEST_TAB_WAIT_MS,
     DEFAULT_CURRENCY,
     DEFAULT_GL,
+    DEFAULT_GL_POOL,
     DEFAULT_HL,
     GOOGLE_CONSENT_COOKIES,
     GOOGLE_SOCS_COOKIE_VALUE,
     HEADLESS_MODE,
     NAVIGATION_TIMEOUT_MS,
+    parse_gl_pool,
     redact_proxy_for_log,
     sanitize_log_text,
 )
@@ -86,6 +89,7 @@ class SlotScrapeResult:
     tab_clicks: int = 0
     loaders_time_s: Optional[float] = None
     gl: Optional[str] = None
+    winning_gl: Optional[str] = None
     raw_top_offers: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1222,6 +1226,7 @@ class PooledPatchrightSession:
                 tab_clicks=tab_clicks,
                 loaders_time_s=loaders_time_s,
                 gl=gl_eff,
+                winning_gl=gl_eff,
                 raw_top_offers=consolidated["top_3_dicts"],
             )
         finally:
@@ -2374,3 +2379,130 @@ def scrape_date_slot(
 
     logger.error("%sAll 3 extraction layers failed to extract prices for URL: %s", slot_tag, url[:100])
     return None
+
+
+_BASE_SCRAPE_DATE_SLOT = scrape_date_slot
+
+
+def _effective_result_price(res: Optional[SlotScrapeResult]) -> Optional[float]:
+    """Return positive `cheapest_tab_price or best_tab_price` for Multi-GL comparison."""
+    if res is None:
+        return None
+    if res.cheapest_tab_price is not None and res.cheapest_tab_price > 0:
+        return float(res.cheapest_tab_price)
+    if res.best_tab_price is not None and res.best_tab_price > 0:
+        return float(res.best_tab_price)
+    return None
+
+
+def scrape_date_slot_multi_gl(
+    url: str,
+    gl_pool: Optional[Sequence[str] | str] = None,
+    pooled_session: Optional[PooledPatchrightSession] = None,
+    proxy_url: Optional[str] = None,
+    date_range_label: str = "",
+    inter_gl_delay: tuple[float, float] = (1.0, 1.8),
+) -> Optional[SlotScrapeResult]:
+    """
+    Compete a `date_slot` across all markets in `gl_pool` (deduplicated, in order,
+    default `("MX", "IT", "DE")`) in RAM, reusing a single `PooledPatchrightSession`.
+
+    Selection rules:
+      - Evaluates `effective_price = res.cheapest_tab_price or res.best_tab_price` (> 0).
+      - On exact price tie, favors the first market in `gl_pool` order (e.g. MX wins ties).
+      - Tolerates individual `gl` failures as long as at least one `gl` returns a valid offer.
+      - Returns ONLY the winning `SlotScrapeResult` with `winning_gl` populated and logs
+        one compact comparison line.
+    """
+    start_ts = time.perf_counter()
+    markets = parse_gl_pool(gl_pool, fallback=DEFAULT_GL_POOL)
+    slot_tag = f"[{date_range_label}] " if date_range_label else ""
+
+    session_to_use = pooled_session
+    own_session = False
+    active_proxy = session_to_use.proxy_url if session_to_use is not None else proxy_url
+
+    if session_to_use is None and scrape_date_slot is _BASE_SCRAPE_DATE_SLOT:
+        try:
+            session_to_use = PooledPatchrightSession(proxy_url=active_proxy, headless=HEADLESS_MODE).start()
+            own_session = True
+            active_proxy = session_to_use.proxy_url
+        except Exception as init_exc:
+            logger.debug(
+                "%sMulti-GL could not start pooled browser session on %s: %s",
+                slot_tag,
+                redact_proxy_for_log(active_proxy),
+                sanitize_log_text(init_exc),
+            )
+            session_to_use = None
+
+    candidates: list[tuple[int, str, float, SlotScrapeResult]] = []
+    summary_parts: list[str] = []
+
+    try:
+        for idx, gl_code in enumerate(markets):
+            res: Optional[SlotScrapeResult] = None
+            try:
+                res = scrape_date_slot(
+                    url=url,
+                    pooled_session=session_to_use,
+                    proxy_url=active_proxy,
+                    date_range_label=date_range_label,
+                    gl=gl_code,
+                )
+                if session_to_use is not None:
+                    active_proxy = session_to_use.proxy_url
+            except Exception as exc:
+                logger.warning(
+                    "%sMulti-GL gl=%s failed (%s); continuing pool.",
+                    slot_tag,
+                    gl_code,
+                    sanitize_log_text(exc),
+                )
+
+            eff_price = _effective_result_price(res)
+            if res is not None and eff_price is not None and eff_price > 0:
+                candidates.append((idx, gl_code, eff_price, res))
+                summary_parts.append(f"{gl_code}=${eff_price:,.0f}")
+            else:
+                summary_parts.append(f"{gl_code}=ERR")
+
+            if idx < len(markets) - 1 and inter_gl_delay:
+                lo, hi = inter_gl_delay
+                if hi > 0:
+                    time.sleep(random.uniform(max(0.0, lo), max(lo, hi)))
+    finally:
+        if own_session and session_to_use is not None:
+            try:
+                session_to_use.close()
+            except Exception:
+                pass
+
+    elapsed = time.perf_counter() - start_ts
+    if not candidates:
+        logger.warning(
+            "%smulti_gl: %s -> no valid offers in %.1fs",
+            slot_tag,
+            " | ".join(summary_parts),
+            elapsed,
+        )
+        return None
+
+    _, winner_gl, winner_price, winner_res = min(candidates, key=lambda item: (item[2], item[0]))
+    winner_res.winning_gl = winner_gl
+    winner_res.gl = winner_gl
+    best_val = (
+        float(winner_res.best_tab_price)
+        if (winner_res.best_tab_price is not None and winner_res.best_tab_price > 0)
+        else winner_price
+    )
+    logger.info(
+        "%smulti_gl: %s -> winner=%s ($%s, Best=$%s) in %.1fs",
+        slot_tag,
+        " | ".join(summary_parts),
+        winner_gl,
+        f"{winner_price:,.0f}",
+        f"{best_val:,.0f}",
+        elapsed,
+    )
+    return winner_res

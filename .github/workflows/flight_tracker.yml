@@ -1,16 +1,12 @@
-name: FlightPulse Matrix v4.0 — Sharded 20x10 Flight Scanner
+name: FlightPulse Matrix v5.0 — 6-Shard Multi-GL Flight Scanner
 
 on:
-  schedule:
-    # Runs every 60 minutes, processing up to 50 due date_slots per batch
-    # (with 4h default check_interval_minutes -> 200 slots covered 6x/day cleanly).
-    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       max_slots:
-        description: 'Maximum due date_slots to scan in this batch'
+        description: 'Maximum due date_slots to scan across this shard'
         required: false
-        default: '50'
+        default: '500'
         type: string
       force_all:
         description: 'Ignore check_interval_minutes and force scan active slots'
@@ -26,6 +22,10 @@ jobs:
   scan-flight-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
 
     steps:
       - name: Checkout Repository
@@ -70,7 +70,7 @@ jobs:
           sleep 3
           ss -tlnp | grep 40000 || echo "WARP proxy not listening on 40000; runner will automatically fall back to direct connection."
 
-      - name: Execute Sharded Dual-Tab Matrix Scanner
+      - name: Execute Shard ${{ matrix.shard }}/6 Multi-GL RAM-Buffered Scanner
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -79,9 +79,9 @@ jobs:
           PROXY_LIST: ${{ secrets.PROXY_LIST }}
           HEADLESS_MODE: 'false'
         run: |
-          MAX_SLOTS="${{ inputs.max_slots || '50' }}"
+          MAX_SLOTS="${{ inputs.max_slots || '500' }}"
           FORCE_FLAG=""
           if [ "${{ inputs.force_all }}" = "true" ]; then
             FORCE_FLAG="--force-all"
           fi
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -m src.runner --max-slots $MAX_SLOTS $FORCE_FLAG
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -m src.runner --shard-index ${{ matrix.shard }} --total-shards 6 --max-slots $MAX_SLOTS $FORCE_FLAG

@@ -62,7 +62,7 @@ def audit_db_summary() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     print("\n" + "=" * 128)
     print(
-        f"{'ID':>3} | {'DESTINO':<28} | {'META':>10} | {'ACT':>3} | {'CD':>3} | "
+        f"{'ID':>3} | {'DESTINO':<28} | {'META':>10} | {'ACT':>3} | {'GL POOL':<9} | "
         f"{'MIN HIST BD':>12} | {'MAX HIST BD':>12} | {'ULT CHEAPEST':>12} | {'SLOTS c/DATOS':>13}"
     )
     print("-" * 128)
@@ -107,11 +107,11 @@ def audit_db_summary() -> list[dict[str, Any]]:
         d_last_min = min(latests) if latests else None
         alerts_on = bool(d.get("is_active", True))
         target_p = float(d.get("target_price") or 0)
-        cooldown_h = int(d.get("cooldown_hours") or 12)
+        gl_pool_str = str(d.get("gl_pool") or d.get("gl") or "MX,IT,DE")
 
         print(
             f"{d_id:>3} | {str(d.get('name') or '')[:28]:<28} | "
-            f"${target_p:>9,.0f} | {'YES' if alerts_on else 'NO ':>3} | {cooldown_h:>2}h | "
+            f"${target_p:>9,.0f} | {'YES' if alerts_on else 'NO ':>3} | {gl_pool_str:<9} | "
             f"{f'${d_min:,.0f}' if d_min is not None else 'N/A':>12} | "
             f"{f'${d_max:,.0f}' if d_max is not None else 'N/A':>12} | "
             f"{f'${d_last_min:,.0f}' if d_last_min is not None else 'N/A':>12} | "
@@ -288,7 +288,6 @@ def run_trigger_simulations(audit_rows: list[dict[str, Any]]) -> None:
             slot_meta = {
                 **chosen_slot,
                 "target_price": temp_target,
-                "cooldown_hours": chosen_dest.get("cooldown_hours", 12),
                 "filter_config": chosen_dest.get("filter_config") or {},
             }
             if clear_last_alert:

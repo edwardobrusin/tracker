@@ -1,15 +1,15 @@
 """
-FlightPulse Matrix v4.0 — Executive Streamlit Control Center (`app.py`).
+FlightPulse Matrix v5.0 — Executive Streamlit Control Center (`app.py`).
 
-Redesigned according to `skills/frontend-design`, `skills/ui-styling`, and `skills/ui-ux-pro-max`.
 Features:
+  - 50×10 Capacity (500 date_slots), 6-Shard Parallelism & Multi-GL Competition (MX, IT, DE)
   - 330-Day Advance Booking Window Intelligence (airline release cycle tracking)
   - Single-Calendar Range Picker in Tab 2 (fluid 1-click start / 2-click return)
-  - Honest status & verified Telegram alerts (zero fabricated prices)
+  - Honest status & verified Telegram alerts (zero fabricated prices, instant threshold alerts)
   - Executive Aviation Radar Dark Theme with high contrast & accessible typography
-  - Tab 1: 10-Date Matrix Comparison Table + Plotly Multi-Date & Dual-Tab Evolution Charts
-  - Tab 2: 2-Step Flight Corridor & Filter Profile + Options A, B (Interactive Range), C
-  - Tab 3: Live Scanner, Extraction Health & Telegram Tester
+  - Tab 1: 10-Date Matrix Comparison Table (with POS & dynamic booking links) + Plotly Charts
+  - Tab 2: 2-Step Flight Corridor, Multi-GL Pool & Filter Profile + Options A, B, C
+  - Tab 3: Live Multi-GL Scanner, Extraction Health & Telegram Tester
 """
 
 from __future__ import annotations
@@ -31,13 +31,16 @@ from src.config import (
     DEFAULT_CHECK_INTERVAL_MINUTES,
     DEFAULT_CURRENCY,
     DEFAULT_GL,
+    DEFAULT_GL_POOL,
     DEFAULT_HL,
     GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS,
     MAX_DESTINATIONS,
     MAX_SLOTS_PER_DESTINATION,
     MAX_TOTAL_SLOTS,
+    SUPPORTED_GL_MARKETS,
     get_flight_window_status,
     get_proxy_pool,
+    parse_gl_pool,
     sanitize_log_text,
     test_proxy_connection,
 )
@@ -59,18 +62,20 @@ from src.db import (
 )
 from src.runner import run_sharded_dispatcher
 from src.tfs_builder import (
+    CHEAPEST_TFU,
     FilterProfile,
     build_google_flights_url,
     format_corridor_display,
     format_date_slot_label,
     generate_date_matrix,
+    normalize_flights_url,
     normalize_iata_codes,
     parse_iata_list,
     parse_pasted_urls,
 )
 
 st.set_page_config(
-    page_title=f"FlightPulse Matrix v4.0 | {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Stealth Flight Tracker",
+    page_title=f"FlightPulse Matrix v5.0 | {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Multi-GL Flight Tracker",
     page_icon="✈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -249,9 +254,9 @@ def check_password_gate() -> bool:
     col_left, col_center, col_right = st.columns([1, 1.4, 1])
     with col_center:
         st.markdown("")
-        st.markdown("## FlightPulse Matrix v4.0")
+        st.markdown("## FlightPulse Matrix v5.0")
         st.caption(
-            f"Self-Hosted {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Google Flights Dual-Tab Stealth Engine (`Best` vs. `Cheapest`)"
+            f"Self-Hosted {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Google Flights Multi-GL Dual-Tab Stealth Engine (`Best` vs. `Cheapest`)"
         )
         with st.form("login_form", clear_on_submit=False):
             pwd_input = st.text_input(
@@ -439,7 +444,7 @@ def render_tab1_matrix_explorer() -> None:
                     <div style="margin-top: 8px; font-size: 0.88rem; color: #94A3B8;">
                         <strong>Meta:</strong> <span style="color: #34D399; font-weight: 600;">${float(selected_dest['target_price']):,.0f} {selected_dest['currency']}</span>
                         &nbsp;•&nbsp; <strong>Escaneo:</strong> Cada {selected_dest.get('check_interval_minutes', DEFAULT_CHECK_INTERVAL_MINUTES)}m
-                        &nbsp;•&nbsp; <strong>Cooldown:</strong> {selected_dest.get('cooldown_hours', 12)}h
+                        &nbsp;•&nbsp; <strong>POS Pool:</strong> {', '.join(parse_gl_pool(selected_dest.get('gl_pool') or selected_dest.get('gl')))}
                     </div>
                 </div>
                 <div>
@@ -527,12 +532,20 @@ def render_tab1_matrix_explorer() -> None:
             airline_stops_str = "Dentro de ventana (Sin escaneo aún)"
             dur_str = "—"
 
+        slot_winning_gl = str(s.get("last_winning_gl") or s.get("gl") or DEFAULT_GL).strip().upper()
+        raw_slot_url = str(s.get("google_flights_url") or "https://www.google.com/travel/flights").strip()
+        try:
+            dynamic_booking_url = normalize_flights_url(raw_slot_url, tfu=CHEAPEST_TFU, gl=slot_winning_gl)
+        except Exception:
+            dynamic_booking_url = raw_slot_url
+
         matrix_rows.append(
             {
                 "ID": int(s["id"]),
                 "Estado": "Activo" if s.get("is_active") else "Pausado",
                 "Fecha / Tramo": date_pair_label,
                 "Ruta Ganadora": winning_route_str,
+                "POS": slot_winning_gl if not is_future else "—",
                 "Ventana (330d)": win_info.get("badge", "Dentro de ventana"),
                 "Más Baratos": c_price_fmt,
                 "Mejores Vuelos": b_price_fmt,
@@ -542,7 +555,7 @@ def render_tab1_matrix_explorer() -> None:
                 "Mín. Histórico": atl_fmt,
                 "Vs Meta": target_diff_fmt,
                 "Último Chequeo": _format_relative_time(s.get("last_checked_at")),
-                "Google Flights": s.get("google_flights_url"),
+                "Google Flights": dynamic_booking_url,
                 "_raw_cheapest": c_price,
                 "_raw_best": b_price,
                 "_is_future": is_future,
@@ -553,6 +566,7 @@ def render_tab1_matrix_explorer() -> None:
     display_cols = [
         "Fecha / Tramo",
         "Ruta Ganadora",
+        "POS",
         "Ventana (330d)",
         "Más Baratos",
         "Mejores Vuelos",
@@ -572,6 +586,7 @@ def render_tab1_matrix_explorer() -> None:
         column_config={
             "Fecha / Tramo": st.column_config.TextColumn("Fecha / Tramo", width="medium"),
             "Ruta Ganadora": st.column_config.TextColumn("Ruta Ganadora", width="small"),
+            "POS": st.column_config.TextColumn("POS", width="small"),
             "Ventana (330d)": st.column_config.TextColumn("Ventana (330d)", width="medium"),
             "Más Baratos": st.column_config.TextColumn("Más Baratos", width="small"),
             "Mejores Vuelos": st.column_config.TextColumn("Mejores Vuelos", width="small"),
@@ -990,7 +1005,7 @@ def render_tab2_destination_and_generator() -> None:
                 key=f"dest_trip_{key_suffix}",
             )
 
-        r2c1, r2c2, r2c3, r2c4, r2c5, r2c6 = st.columns([1.05, 0.8, 0.85, 0.95, 0.95, 1.0])
+        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1.05, 0.85, 1.4, 0.95, 0.95])
         with r2c1:
             target_price_val = st.number_input(
                 "Precio meta",
@@ -1010,16 +1025,21 @@ def render_tab2_destination_and_generator() -> None:
                 key=f"dest_curr_{key_suffix}",
             )
         with r2c3:
-            gl_options = ["MX", "IT", "ES", "DE", "US"]
-            curr_gl = str(existing_dest.get("gl") or DEFAULT_GL).strip().upper() if existing_dest else DEFAULT_GL
-            if curr_gl not in gl_options:
-                gl_options.append(curr_gl)
-            gl_val = st.selectbox(
-                "Mercado / POS (gl)",
+            existing_pool = (
+                parse_gl_pool(existing_dest.get("gl_pool") or existing_dest.get("gl"), fallback=DEFAULT_GL_POOL)
+                if existing_dest
+                else list(DEFAULT_GL_POOL)
+            )
+            gl_options = list(SUPPORTED_GL_MARKETS)
+            for code in existing_pool:
+                if code not in gl_options:
+                    gl_options.append(code)
+            gl_pool_val = st.multiselect(
+                "Mercados / POS (gl_pool)",
                 options=gl_options,
-                index=gl_options.index(curr_gl) if curr_gl in gl_options else 0,
-                help="Mercado Google Flights (gl): usa IT para hubs europeos o MX por defecto.",
-                key=f"dest_gl_{key_suffix}",
+                default=existing_pool,
+                help="Mercados Google Flights a competir en cada escaneo (gana el menor precio; en empate gana el primero).",
+                key=f"dest_gl_pool_{key_suffix}",
             )
         with r2c4:
             cabins = ["economy", "premium-economy", "business", "first"]
@@ -1045,7 +1065,7 @@ def render_tab2_destination_and_generator() -> None:
             interval_idx = (
                 interval_choices.index(curr_interval)
                 if curr_interval in interval_choices
-                else interval_choices.index(240)
+                else 0
             )
             check_interval_val = st.selectbox(
                 "Escaneo",
@@ -1053,17 +1073,6 @@ def render_tab2_destination_and_generator() -> None:
                 index=interval_idx,
                 format_func=lambda m: f"Cada {m // 60}h",
                 key=f"dest_interval_{key_suffix}",
-            )
-        with r2c6:
-            cooldown_choices = [6, 12, 24]
-            curr_cd = int(existing_dest.get("cooldown_hours", 12)) if existing_dest else 12
-            cooldown_val = st.selectbox(
-                "Cooldown",
-                options=cooldown_choices,
-                index=cooldown_choices.index(curr_cd) if curr_cd in cooldown_choices else 1,
-                format_func=lambda h: f"{h} horas",
-                help="Espera mínima entre re-alertas por Meta cuando cae >=3% (Bajo Histórico y caídas >=5% siempre alertan inmediato).",
-                key=f"dest_cooldown_{key_suffix}",
             )
 
         with st.expander("Filtros opcionales", expanded=has_custom_filters):
@@ -1198,6 +1207,8 @@ def render_tab2_destination_and_generator() -> None:
                         norm_orig = normalize_iata_codes(origin_val, expand_metro=True)
                         norm_dest = normalize_iata_codes(dest_val, expand_metro=True)
                         corridor_disp = format_corridor_display(norm_orig, norm_dest)
+                        clean_gl_pool = parse_gl_pool(gl_pool_val, fallback=DEFAULT_GL_POOL)
+                        primary_gl = clean_gl_pool[0]
 
                         if editing_dest_id is None:
                             new_id = create_destination(
@@ -1207,10 +1218,10 @@ def render_tab2_destination_and_generator() -> None:
                                 target_price=float(target_price_val),
                                 trip_type=trip_type_val,
                                 currency=currency_val,
-                                gl=gl_val,
+                                gl=primary_gl,
                                 hl=DEFAULT_HL,
                                 check_interval_minutes=int(check_interval_val),
-                                cooldown_hours=int(cooldown_val),
+                                gl_pool=clean_gl_pool,
                                 filter_config=profile_obj.to_dict(),
                                 is_active=True,
                             )
@@ -1229,10 +1240,10 @@ def render_tab2_destination_and_generator() -> None:
                                 target_price=float(target_price_val),
                                 trip_type=trip_type_val,
                                 currency=currency_val,
-                                gl=gl_val,
+                                gl=primary_gl,
                                 hl=DEFAULT_HL,
                                 check_interval_minutes=int(check_interval_val),
-                                cooldown_hours=int(cooldown_val),
+                                gl_pool=clean_gl_pool,
                                 filter_config=profile_obj.to_dict(),
                                 is_active=bool(existing_dest.get("is_active", True)) if existing_dest else True,
                             )
@@ -1736,10 +1747,10 @@ def render_tab3_scanner_and_logs() -> None:
     col_scan, col_tg = st.columns([1.45, 1.15])
 
     with col_scan:
-        st.markdown("### Escáner en Vivo (Immediate Dual-Tab Check)")
+        st.markdown("### Escáner en Vivo (Multi-GL Dual-Tab Check)")
         st.caption(
-            "Ejecuta el motor híbrido (`Patchright` Pestañas Mejores + Más Baratos + `ds:1` + fallback SSR) "
-            "respetando la ventana de 330 días."
+            "Ejecuta la competencia Multi-GL (`gl_pool`, ej. MX, IT, DE) con el motor híbrido "
+            "(`Patchright` `tfu=EgoIABAAGAAgAigB` + `ds:1` + fallback SSR) respetando la ventana de 330 días."
         )
 
         scan_scope = st.radio(
@@ -1975,8 +1986,8 @@ def main() -> None:
         return
 
     with st.sidebar:
-        st.markdown("## FlightPulse v4.0")
-        st.caption(f"Matrix {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Stealth Flight Engine")
+        st.markdown("## FlightPulse v5.0")
+        st.caption(f"Matrix {MAX_DESTINATIONS}×{MAX_SLOTS_PER_DESTINATION} Multi-GL Flight Engine")
         st.markdown("---")
         st.markdown(
             f"""
@@ -1984,9 +1995,10 @@ def main() -> None:
             - **Destinos Activos:** Hasta `{MAX_DESTINATIONS}`
             - **Fechas por Destino:** Hasta `{MAX_SLOTS_PER_DESTINATION}`
             - **Capacidad Total:** `{MAX_TOTAL_SLOTS}` Date Slots
+            - **Competencia Multi-GL:** `{', '.join(DEFAULT_GL_POOL)}`
             - **Extracción Dual:** `Más baratos` vs `Mejores`
             - **Ventana Oficial:** `330 días` máx. anticipación
-            - **Anti-Ban Queue:** Sharded cada 60m (`50` slots/run)
+            - **Sharding Paralelo:** `6` shards (RAM Buffer + `cron-job.org`)
             """
         )
         st.markdown("---")
@@ -2002,7 +2014,7 @@ def main() -> None:
 
     summary = get_dashboard_summary()
 
-    st.markdown("## FlightPulse Matrix v4.0 — Control Center")
+    st.markdown("## FlightPulse Matrix v5.0 — Control Center")
     render_top_metrics_ribbon(summary)
     st.markdown("")
 

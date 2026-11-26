@@ -1,6 +1,6 @@
 """
 Centralized configuration, environment variable loader, and stealth constants
-for FlightPulse Matrix v4.0.
+for FlightPulse Matrix v5.0.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
 try:
@@ -71,20 +71,50 @@ TELEGRAM_BOT_TOKEN: str = _get_setting("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = _get_setting("TELEGRAM_CHAT_ID", "")
 APP_PASSWORD: str = _get_setting("APP_PASSWORD", "flightpulse-matrix-2026")
 
-# Matrix 20x10 Capacity Limits & Sharded Dispatcher Settings
-MAX_DESTINATIONS: int = int(_get_setting("MAX_DESTINATIONS", "20"))
+# Matrix 50x10 Capacity Limits & Sharded Dispatcher Settings
+MAX_DESTINATIONS: int = int(_get_setting("MAX_DESTINATIONS", "50"))
 MAX_SLOTS_PER_DESTINATION: int = int(_get_setting("MAX_SLOTS_PER_DESTINATION", "10"))
 MAX_TOTAL_SLOTS: int = MAX_DESTINATIONS * MAX_SLOTS_PER_DESTINATION
-MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "50"))
-DEFAULT_CHECK_INTERVAL_MINUTES: int = int(_get_setting("DEFAULT_CHECK_INTERVAL_MINUTES", "240"))
+MAX_SLOTS_PER_RUN: int = int(_get_setting("MAX_SLOTS_PER_RUN", "500"))
+DEFAULT_CHECK_INTERVAL_MINUTES: int = int(_get_setting("DEFAULT_CHECK_INTERVAL_MINUTES", "60"))
+DUE_GRACE_MINUTES: int = int(_get_setting("DUE_GRACE_MINUTES", "5"))
 
 # Google Flights Schedule Advance Booking Window (airline industry 330-337 day release)
 GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS: int = int(_get_setting("GOOGLE_FLIGHTS_MAX_ADVANCE_DAYS", "330"))
 
-# Default Locale Settings
+# Default Locale & Multi-GL Competition Settings
 DEFAULT_CURRENCY: str = _get_setting("DEFAULT_CURRENCY", "MXN")
 DEFAULT_GL: str = _get_setting("DEFAULT_GL", "MX")
 DEFAULT_HL: str = _get_setting("DEFAULT_HL", "es")
+DEFAULT_GL_POOL: tuple[str, ...] = ("MX", "IT", "DE")
+SUPPORTED_GL_MARKETS: tuple[str, ...] = ("MX", "IT", "DE", "ES", "US")
+
+
+def parse_gl_pool(
+    raw_pool: Any = None,
+    fallback: Sequence[str] = DEFAULT_GL_POOL,
+) -> list[str]:
+    """
+    Parse and deduplicate a Multi-GL pool (string like 'MX,IT,DE' or sequence)
+    preserving pool priority order. Falls back to `DEFAULT_GL_POOL` when empty.
+    """
+    tokens: list[str] = []
+    if isinstance(raw_pool, str):
+        tokens = [t.strip().upper() for t in re.split(r"[,;\s]+", raw_pool) if t.strip()]
+    elif isinstance(raw_pool, (list, tuple, set)):
+        for item in raw_pool:
+            for t in re.split(r"[,;\s]+", str(item)):
+                if t.strip():
+                    tokens.append(t.strip().upper())
+
+    deduped: list[str] = []
+    for tok in tokens:
+        if re.match(r"^[A-Z]{2}$", tok) and tok not in deduped:
+            deduped.append(tok)
+
+    if not deduped:
+        return [str(code).strip().upper() for code in fallback if str(code).strip()]
+    return deduped
 
 # Proxy Configuration
 SOCKS5_PROXY: str = _get_setting("SOCKS5_PROXY", "")

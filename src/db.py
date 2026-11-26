@@ -1,18 +1,21 @@
 """
-Neon Serverless PostgreSQL Data Access Layer (psycopg v3) for FlightPulse Matrix v4.0.
+Neon Serverless PostgreSQL Data Access Layer (psycopg v3) for FlightPulse Matrix v5.0.
 Implements the 4-table hierarchical schema:
   destinations -> date_slots -> price_snapshots + alert_logs
+Supports Multi-GL competition (`gl_pool`, `winning_gl`, `last_winning_gl`, `all_time_low_gl`),
+transactional advisory locks for 6-shard concurrency, and RAM-buffered batch read/flush.
 """
 
 from __future__ import annotations
 
 import copy
+import datetime
 import logging
 import sys
 import threading
 import time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, Sequence, cast
 
 if sys.version_info >= (3, 11):
     from typing import LiteralString
@@ -44,12 +47,15 @@ from src.config import (
     DEFAULT_CHECK_INTERVAL_MINUTES,
     DEFAULT_CURRENCY,
     DEFAULT_GL,
+    DEFAULT_GL_POOL,
     DEFAULT_HL,
+    DUE_GRACE_MINUTES,
     MAX_DESTINATIONS,
     MAX_SLOTS_PER_DESTINATION,
     MAX_SLOTS_PER_RUN,
     MAX_TOTAL_SLOTS,
     get_flight_window_status,
+    parse_gl_pool,
 )
 from src.tfs_builder import (
     FilterProfile,
@@ -71,10 +77,10 @@ CREATE TABLE IF NOT EXISTS destinations (
     trip_type VARCHAR(20) DEFAULT 'round-trip',
     currency VARCHAR(10) DEFAULT 'MXN',
     gl VARCHAR(10) DEFAULT 'MX',
+    gl_pool VARCHAR(64) NOT NULL DEFAULT 'MX,IT,DE',
     hl VARCHAR(10) DEFAULT 'es',
     target_price NUMERIC(12, 2) NOT NULL,
-    check_interval_minutes INTEGER DEFAULT 240,
-    cooldown_hours INTEGER DEFAULT 12,
+    check_interval_minutes INTEGER DEFAULT 60,
     filter_config JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -101,7 +107,9 @@ CREATE TABLE IF NOT EXISTS date_slots (
     latest_best_origin_airport VARCHAR(10),
     latest_best_destination_airport VARCHAR(10),
     latest_is_self_transfer BOOLEAN DEFAULT FALSE,
+    last_winning_gl VARCHAR(8) NOT NULL DEFAULT 'MX',
     all_time_low_price NUMERIC(12, 2),
+    all_time_low_gl VARCHAR(8),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -124,6 +132,7 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     best_origin_airport VARCHAR(10),
     best_destination_airport VARCHAR(10),
     is_self_transfer BOOLEAN DEFAULT FALSE,
+    winning_gl VARCHAR(8) NOT NULL DEFAULT 'MX',
     extraction_source VARCHAR(30) DEFAULT 'patchright_dom',
     raw_top_offers JSONB DEFAULT '[]'
 );
@@ -184,6 +193,36 @@ ALTER TABLE IF EXISTS price_snapshots
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_destinations_unique_name
     ON destinations (LOWER(TRIM(name)));
+
+ALTER TABLE IF EXISTS destinations
+    DROP COLUMN IF EXISTS cooldown_hours;
+
+ALTER TABLE IF EXISTS destinations
+    ADD COLUMN IF NOT EXISTS gl_pool VARCHAR(64) NOT NULL DEFAULT 'MX,IT,DE';
+
+ALTER TABLE IF EXISTS destinations
+    ALTER COLUMN check_interval_minutes SET DEFAULT 60;
+
+ALTER TABLE IF EXISTS price_snapshots
+    ADD COLUMN IF NOT EXISTS winning_gl VARCHAR(8) NOT NULL DEFAULT 'MX';
+
+ALTER TABLE IF EXISTS date_slots
+    ADD COLUMN IF NOT EXISTS last_winning_gl VARCHAR(8) NOT NULL DEFAULT 'MX',
+    ADD COLUMN IF NOT EXISTS all_time_low_gl VARCHAR(8);
+
+UPDATE destinations
+SET gl_pool = 'MX,IT,DE'
+WHERE gl_pool IS NULL OR TRIM(gl_pool) = '';
+
+UPDATE destinations
+SET check_interval_minutes = 60
+WHERE check_interval_minutes > 60;
+
+UPDATE date_slots ds
+SET last_winning_gl = COALESCE(NULLIF(ds.last_winning_gl, ''), d.gl, 'MX')
+FROM destinations d
+WHERE ds.destination_id = d.id
+  AND (ds.last_winning_gl IS NULL OR ds.last_winning_gl = '');
 """
 
 
@@ -412,9 +451,26 @@ def get_connection(retries: int = 3, delay_seconds: float = 1.5) -> _ReusableCon
     return _ReusableConnectionContext(raw_conn)
 
 
+def close_db_connection() -> None:
+    """
+    Explicitly close and clear the persistent thread-local `psycopg` connection
+    so Neon Serverless compute can enter sleep during the RAM-buffered scraping phase.
+    """
+    _discard_thread_connection()
+
+
+def is_db_connected() -> bool:
+    """Return True if the current thread holds an open `psycopg` connection."""
+    raw_conn = getattr(_THREAD_LOCAL, "conn", None)
+    if raw_conn is None:
+        return False
+    return not bool(getattr(raw_conn, "closed", True))
+
+
 def init_db(force: bool = False) -> None:
     """
-    Auto-initialize the 4 tables, execute idempotent N:M multi-airport migrations,
+    Auto-initialize the 4 tables, execute idempotent v5.0 schema migrations
+    under a PostgreSQL transactional advisory lock (`pg_advisory_xact_lock(742918341)`),
     and verify indexes in Neon PostgreSQL once per process.
     """
     global _db_initialized
@@ -425,11 +481,12 @@ def init_db(force: bool = False) -> None:
             return
         with get_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(742918341);")
                 cur.execute(cast(LiteralString, SCHEMA_SQL))
                 cur.execute(cast(LiteralString, MIGRATION_SQL))
             conn.commit()
         _db_initialized = True
-        logger.info("Database schema initialized and migrated for N:M Multi-Airport support.")
+        logger.info("Database schema initialized and migrated for FlightPulse Matrix v5.0.")
 
 
 # ==============================================================================
@@ -478,6 +535,9 @@ def list_destinations(active_only: bool = False) -> list[dict[str, Any]]:
             item["min_best_price"] = _to_float(item.get("min_best_price"))
             item["min_all_time_low"] = _to_float(item.get("min_all_time_low"))
             item["filter_config"] = item.get("filter_config") or {}
+            pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+            item["gl_pool"] = ",".join(pool_list)
+            item["gl"] = str(item.get("gl") or pool_list[0]).strip().upper()
             all_items.append(item)
         _cache_set(cache_key, all_items)
 
@@ -509,6 +569,9 @@ def get_destination(destination_id: int) -> Optional[dict[str, Any]]:
     item = dict(row)
     item["target_price"] = _to_float(item.get("target_price")) or 0.0
     item["filter_config"] = item.get("filter_config") or {}
+    pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+    item["gl_pool"] = ",".join(pool_list)
+    item["gl"] = str(item.get("gl") or pool_list[0]).strip().upper()
     return item
 
 
@@ -558,19 +621,27 @@ def create_destination(
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
     check_interval_minutes: int = DEFAULT_CHECK_INTERVAL_MINUTES,
-    cooldown_hours: int = 12,
+    gl_pool: Optional[str | Sequence[str]] = None,
     filter_config: Optional[dict[str, Any]] = None,
     is_active: bool = True,
 ) -> int:
     """
     Create a new N:M multi-airport destination corridor & filter profile.
     Validates unique destination name, normalizes IATA lists (expanding metro codes
-    like TYO -> NRT,HND), and enforces the 10-destination active matrix limit when is_active=True.
+    like TYO -> NRT,HND), and enforces the active matrix limit (`MAX_DESTINATIONS`) when is_active=True.
     """
     origin_airports = parse_iata_list(origin, expand_metro=True)
     destination_airports = parse_iata_list(destination, expand_metro=True)
     norm_origin = ",".join(origin_airports)
     norm_dest = ",".join(destination_airports)
+
+    if gl_pool is not None:
+        pool_list = parse_gl_pool(gl_pool)
+        clean_gl = pool_list[0]
+    else:
+        pool_list = parse_gl_pool(DEFAULT_GL_POOL)
+        clean_gl = (gl or pool_list[0]).strip().upper()
+    pool_str = ",".join(pool_list)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -590,8 +661,8 @@ def create_destination(
                 """
                 INSERT INTO destinations (
                     name, origin, destination, origin_airports, destination_airports,
-                    trip_type, currency, gl, hl,
-                    target_price, check_interval_minutes, cooldown_hours,
+                    trip_type, currency, gl, gl_pool, hl,
+                    target_price, check_interval_minutes,
                     filter_config, is_active
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -605,11 +676,11 @@ def create_destination(
                     destination_airports,
                     trip_type.strip().lower(),
                     currency.strip().upper(),
-                    gl.strip().upper(),
+                    clean_gl,
+                    pool_str,
                     hl.strip().lower(),
                     Decimal(str(round(target_price, 2))),
                     int(check_interval_minutes),
-                    int(cooldown_hours),
                     Jsonb(filter_config or {}),
                     bool(is_active),
                 ),
@@ -620,7 +691,7 @@ def create_destination(
             new_id = int(row["id"])
         conn.commit()
     clear_db_cache()
-    logger.info("Created destination id=%d (%s: %s -> %s)", new_id, clean_name, norm_origin, norm_dest)
+    logger.info("Created destination id=%d (%s: %s -> %s, gl_pool=%s)", new_id, clean_name, norm_origin, norm_dest, pool_str)
     return new_id
 
 
@@ -635,13 +706,13 @@ def update_destination(
     gl: str = DEFAULT_GL,
     hl: str = DEFAULT_HL,
     check_interval_minutes: int = DEFAULT_CHECK_INTERVAL_MINUTES,
-    cooldown_hours: int = 12,
+    gl_pool: Optional[str | Sequence[str]] = None,
     filter_config: Optional[dict[str, Any]] = None,
     is_active: bool = True,
 ) -> None:
     """
-    Update an existing destination's metadata, N:M airport lists, and filter profile,
-    and automatically regenerate `google_flights_url` on all child `date_slots`.
+    Update an existing destination's metadata, N:M airport lists, Multi-GL pool,
+    and filter profile, and automatically regenerate `google_flights_url` on all child `date_slots`.
     """
     origin_airports = parse_iata_list(origin, expand_metro=True)
     destination_airports = parse_iata_list(destination, expand_metro=True)
@@ -649,7 +720,13 @@ def update_destination(
     norm_dest = ",".join(destination_airports)
     clean_trip = trip_type.strip().lower()
     clean_curr = currency.strip().upper()
-    clean_gl = gl.strip().upper()
+    if gl_pool is not None:
+        pool_list = parse_gl_pool(gl_pool)
+        clean_gl = pool_list[0]
+    else:
+        pool_list = parse_gl_pool(DEFAULT_GL_POOL)
+        clean_gl = (gl or pool_list[0]).strip().upper()
+    pool_str = ",".join(pool_list)
     clean_hl = hl.strip().lower()
     profile_obj = FilterProfile.from_dict(filter_config or {})
 
@@ -679,10 +756,10 @@ def update_destination(
                     trip_type = %s,
                     currency = %s,
                     gl = %s,
+                    gl_pool = %s,
                     hl = %s,
                     target_price = %s,
                     check_interval_minutes = %s,
-                    cooldown_hours = %s,
                     filter_config = %s,
                     is_active = %s
                 WHERE id = %s;
@@ -696,10 +773,10 @@ def update_destination(
                     clean_trip,
                     clean_curr,
                     clean_gl,
+                    pool_str,
                     clean_hl,
                     Decimal(str(round(target_price, 2))),
                     int(check_interval_minutes),
-                    int(cooldown_hours),
                     Jsonb(filter_config or {}),
                     bool(is_active),
                     destination_id,
@@ -799,10 +876,10 @@ def list_date_slots(
                 d.trip_type AS trip_type,
                 d.currency AS currency,
                 d.gl AS gl,
+                d.gl_pool AS gl_pool,
                 d.hl AS hl,
                 d.target_price AS target_price,
                 d.check_interval_minutes AS check_interval_minutes,
-                d.cooldown_hours AS cooldown_hours,
                 d.filter_config AS filter_config,
                 d.is_active AS destination_is_active
             FROM date_slots ds
@@ -823,6 +900,9 @@ def list_date_slots(
             item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
             item["target_price"] = _to_float(item.get("target_price")) or 0.0
             item["filter_config"] = item.get("filter_config") or {}
+            pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+            item["gl_pool"] = ",".join(pool_list)
+            item["last_winning_gl"] = str(item.get("last_winning_gl") or item.get("gl") or pool_list[0]).strip().upper()
             item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
             all_slots.append(item)
         _cache_set(cache_key, all_slots)
@@ -848,10 +928,10 @@ def get_date_slot(slot_id: int) -> Optional[dict[str, Any]]:
             d.trip_type AS trip_type,
             d.currency AS currency,
             d.gl AS gl,
+            d.gl_pool AS gl_pool,
             d.hl AS hl,
             d.target_price AS target_price,
             d.check_interval_minutes AS check_interval_minutes,
-            d.cooldown_hours AS cooldown_hours,
             d.filter_config AS filter_config,
             d.is_active AS destination_is_active
         FROM date_slots ds
@@ -871,6 +951,9 @@ def get_date_slot(slot_id: int) -> Optional[dict[str, Any]]:
     item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
     item["target_price"] = _to_float(item.get("target_price")) or 0.0
     item["filter_config"] = item.get("filter_config") or {}
+    pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+    item["gl_pool"] = ",".join(pool_list)
+    item["last_winning_gl"] = str(item.get("last_winning_gl") or item.get("gl") or pool_list[0]).strip().upper()
     return item
 
 
@@ -1085,16 +1168,69 @@ def delete_date_slot(slot_id: int) -> None:
     clear_db_cache()
 
 
+def partition_destinations_into_shards(
+    destinations: Sequence[dict[str, Any]],
+    total_shards: int = 6,
+) -> list[list[dict[str, Any]]]:
+    """
+    Deterministic greedy bin-packing of active destinations across `total_shards` buckets.
+    Sorts destinations by `(-active_slot_count, destination_id)` and always assigns the
+    next destination to the shard with the lowest accumulated slot load (tie-break: lowest shard index).
+    """
+    if total_shards < 1:
+        raise ValueError(f"total_shards must be >= 1, got {total_shards}")
+
+    def _dest_id(d: dict[str, Any]) -> int:
+        raw = d.get("id") if d.get("id") is not None else d.get("destination_id")
+        return int(raw or 0)
+
+    def _slot_count(d: dict[str, Any]) -> int:
+        for k in ("active_slot_count", "active_in_window_slots", "active_slots", "slot_count"):
+            if d.get(k) is not None:
+                return max(0, int(d[k]))
+        return 0
+
+    ordered = sorted(
+        destinations,
+        key=lambda d: (-_slot_count(d), _dest_id(d)),
+    )
+    buckets: list[list[dict[str, Any]]] = [[] for _ in range(total_shards)]
+    loads = [0] * total_shards
+
+    for dest in ordered:
+        best_shard = min(range(total_shards), key=lambda idx: (loads[idx], idx))
+        buckets[best_shard].append(dict(dest))
+        loads[best_shard] += _slot_count(dest)
+
+    return buckets
+
+
+def assign_destinations_to_shard(
+    destinations: Sequence[dict[str, Any]],
+    shard_index: int,
+    total_shards: int = 6,
+) -> list[dict[str, Any]]:
+    """
+    Return the deterministic, 100% disjoint subset of destinations assigned to `shard_index`.
+    """
+    if total_shards < 1:
+        raise ValueError(f"total_shards must be >= 1, got {total_shards}")
+    if shard_index < 0 or shard_index >= total_shards:
+        raise ValueError(f"shard_index ({shard_index}) must be in [0, {total_shards - 1}]")
+    return partition_destinations_into_shards(destinations, total_shards=total_shards)[shard_index]
+
+
 def fetch_due_date_slots(
     max_slots: int = MAX_SLOTS_PER_RUN,
     force_all: bool = False,
     destination_id: Optional[int] = None,
     slot_id: Optional[int] = None,
+    due_grace_minutes: int = DUE_GRACE_MINUTES,
 ) -> list[dict[str, Any]]:
     """
     Sharded Anti-Ban Queue Dispatcher query:
     Selects up to `max_slots` due `date_slots` where `is_active = TRUE` and
-    `(last_checked_at IS NULL OR EXTRACT(EPOCH FROM (NOW() - last_checked_at))/60 >= check_interval_minutes)`,
+    `(last_checked_at IS NULL OR last_checked_at <= NOW() - ((check_interval_minutes - due_grace_minutes) * interval '1 minute'))`,
     ordered by `last_checked_at ASC NULLS FIRST`.
     """
     conditions: list[str] = []
@@ -1115,8 +1251,9 @@ def fetch_due_date_slots(
             params.append(destination_id)
         if not force_all:
             conditions.append(
-                "(ds.last_checked_at IS NULL OR EXTRACT(EPOCH FROM (NOW() - ds.last_checked_at)) / 60.0 >= d.check_interval_minutes)"
+                "(ds.last_checked_at IS NULL OR ds.last_checked_at <= NOW() - (GREATEST(0, d.check_interval_minutes - %s) * INTERVAL '1 minute'))"
             )
+            params.append(int(due_grace_minutes))
 
     where_sql = "WHERE " + " AND ".join(conditions)
     params.append(int(max_slots))
@@ -1130,10 +1267,10 @@ def fetch_due_date_slots(
             d.trip_type AS trip_type,
             d.currency AS currency,
             d.gl AS gl,
+            d.gl_pool AS gl_pool,
             d.hl AS hl,
             d.target_price AS target_price,
             d.check_interval_minutes AS check_interval_minutes,
-            d.cooldown_hours AS cooldown_hours,
             d.filter_config AS filter_config
         FROM date_slots ds
         JOIN destinations d ON d.id = ds.destination_id
@@ -1155,9 +1292,214 @@ def fetch_due_date_slots(
         item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
         item["target_price"] = _to_float(item.get("target_price")) or 0.0
         item["filter_config"] = item.get("filter_config") or {}
+        pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+        item["gl_pool"] = ",".join(pool_list)
+        item["last_winning_gl"] = str(item.get("last_winning_gl") or item.get("gl") or pool_list[0]).strip().upper()
         item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
         results.append(item)
     return results
+
+
+def fetch_shard_due_work_package(
+    shard_index: int = 0,
+    total_shards: int = 1,
+    force_all: bool = False,
+    max_slots: int = MAX_SLOTS_PER_RUN,
+    due_grace_minutes: int = DUE_GRACE_MINUTES,
+    destination_id: Optional[int] = None,
+    slot_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Phase 1 single-round-trip read for RAM-buffered sharded execution:
+      1. Reads all active destinations with their active (<=330d) slot counts.
+      2. Deterministically assigns this shard's disjoint subset via `assign_destinations_to_shard`.
+      3. Fetches due `date_slots` for those destinations along with all historical baselines
+         (`historical_min_price`, `prev_effective_price`, `last_alerted_price`, `last_atl_alerted_price`).
+    """
+    if total_shards < 1:
+        raise ValueError(f"total_shards must be >= 1, got {total_shards}")
+    if shard_index < 0 or shard_index >= total_shards:
+        raise ValueError(f"shard_index ({shard_index}) must be in [0, {total_shards - 1}]")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if slot_id is not None:
+                cur.execute(
+                    """
+                    SELECT
+                        d.*,
+                        COUNT(ds.id) FILTER (
+                            WHERE ds.is_active = TRUE
+                              AND ds.outbound_date::date >= CURRENT_DATE
+                              AND ds.outbound_date::date <= (CURRENT_DATE + INTERVAL '330 days')
+                              AND (ds.return_date IS NULL OR ds.return_date::date <= (CURRENT_DATE + INTERVAL '330 days'))
+                        ) AS active_slot_count
+                    FROM destinations d
+                    JOIN date_slots ds ON ds.destination_id = d.id
+                    WHERE ds.id = %s
+                    GROUP BY d.id;
+                    """,
+                    (slot_id,),
+                )
+                all_dest_rows = [dict(r) for r in cur.fetchall()]
+            elif destination_id is not None:
+                cur.execute(
+                    """
+                    SELECT
+                        d.*,
+                        COUNT(ds.id) FILTER (
+                            WHERE ds.is_active = TRUE
+                              AND ds.outbound_date::date >= CURRENT_DATE
+                              AND ds.outbound_date::date <= (CURRENT_DATE + INTERVAL '330 days')
+                              AND (ds.return_date IS NULL OR ds.return_date::date <= (CURRENT_DATE + INTERVAL '330 days'))
+                        ) AS active_slot_count
+                    FROM destinations d
+                    LEFT JOIN date_slots ds ON ds.destination_id = d.id
+                    WHERE d.id = %s
+                    GROUP BY d.id;
+                    """,
+                    (destination_id,),
+                )
+                all_dest_rows = [dict(r) for r in cur.fetchall()]
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        d.*,
+                        COUNT(ds.id) FILTER (
+                            WHERE ds.is_active = TRUE
+                              AND ds.outbound_date::date >= CURRENT_DATE
+                              AND ds.outbound_date::date <= (CURRENT_DATE + INTERVAL '330 days')
+                              AND (ds.return_date IS NULL OR ds.return_date::date <= (CURRENT_DATE + INTERVAL '330 days'))
+                        ) AS active_slot_count
+                    FROM destinations d
+                    LEFT JOIN date_slots ds ON ds.destination_id = d.id
+                    WHERE d.is_active = TRUE
+                    GROUP BY d.id
+                    ORDER BY d.id ASC;
+                    """
+                )
+                all_dest_rows = [dict(r) for r in cur.fetchall()]
+
+            for d_item in all_dest_rows:
+                d_item["target_price"] = _to_float(d_item.get("target_price")) or 0.0
+                d_item["filter_config"] = d_item.get("filter_config") or {}
+                pool_list = parse_gl_pool(d_item.get("gl_pool") or d_item.get("gl"))
+                d_item["gl_pool"] = ",".join(pool_list)
+                d_item["gl"] = str(d_item.get("gl") or pool_list[0]).strip().upper()
+                d_item["active_slot_count"] = int(d_item.get("active_slot_count") or 0)
+
+            if slot_id is not None or destination_id is not None:
+                assigned_dests = all_dest_rows
+            else:
+                assigned_dests = assign_destinations_to_shard(
+                    all_dest_rows,
+                    shard_index=shard_index,
+                    total_shards=total_shards,
+                )
+
+            if not assigned_dests or int(max_slots) <= 0:
+                return {
+                    "shard_index": shard_index,
+                    "total_shards": total_shards,
+                    "all_active_destinations": all_dest_rows,
+                    "assigned_destinations": assigned_dests,
+                    "due_slots": [],
+                }
+
+            assigned_ids = [int(d["id"]) for d in assigned_dests]
+            conditions: list[str] = ["ds.destination_id = ANY(%s)"]
+            params: list[Any] = [assigned_ids]
+
+            if slot_id is not None:
+                conditions.append("ds.id = %s")
+                params.append(slot_id)
+            else:
+                conditions.append("ds.is_active = TRUE")
+                if destination_id is None:
+                    conditions.append("d.is_active = TRUE")
+                conditions.append("ds.outbound_date::date <= (CURRENT_DATE + INTERVAL '330 days')")
+                conditions.append("ds.outbound_date::date >= CURRENT_DATE")
+                conditions.append("(ds.return_date IS NULL OR ds.return_date::date <= (CURRENT_DATE + INTERVAL '330 days'))")
+                if not force_all:
+                    conditions.append(
+                        "(ds.last_checked_at IS NULL OR ds.last_checked_at <= NOW() - (GREATEST(0, d.check_interval_minutes - %s) * INTERVAL '1 minute'))"
+                    )
+                    params.append(int(due_grace_minutes))
+
+            where_sql = "WHERE " + " AND ".join(conditions)
+            params.append(int(max_slots))
+
+            due_query = f"""
+                SELECT
+                    ds.*,
+                    d.name AS destination_name,
+                    d.origin AS origin,
+                    d.destination AS destination_code,
+                    d.trip_type AS trip_type,
+                    d.currency AS currency,
+                    d.gl AS gl,
+                    d.gl_pool AS gl_pool,
+                    d.hl AS hl,
+                    d.target_price AS target_price,
+                    d.check_interval_minutes AS check_interval_minutes,
+                    d.filter_config AS filter_config,
+                    (
+                        SELECT MIN(ps.cheapest_tab_price)
+                        FROM price_snapshots ps
+                        WHERE ps.date_slot_id = ds.id
+                    ) AS snap_min_price,
+                    (
+                        SELECT COALESCE(al.cheapest_price, al.best_price)
+                        FROM alert_logs al
+                        WHERE al.date_slot_id = ds.id
+                          AND POSITION('ALL_TIME_LOW' IN al.trigger_type) > 0
+                        ORDER BY al.sent_at DESC
+                        LIMIT 1
+                    ) AS last_atl_alerted_price
+                FROM date_slots ds
+                JOIN destinations d ON d.id = ds.destination_id
+                {where_sql}
+                ORDER BY ds.last_checked_at ASC NULLS FIRST, ds.id ASC
+                LIMIT %s;
+            """
+            cur.execute(cast(LiteralString, due_query), tuple(params))
+            slot_rows = cur.fetchall()
+
+    due_slots: list[dict[str, Any]] = []
+    for row in slot_rows:
+        item = dict(row)
+        prev_cheapest = _to_float(item.get("latest_cheapest_price"))
+        prev_best = _to_float(item.get("latest_best_price"))
+        slot_atl = _to_float(item.get("all_time_low_price"))
+        snap_min = _to_float(item.get("snap_min_price"))
+        if slot_atl is not None and snap_min is not None:
+            historical_min_price: Optional[float] = min(slot_atl, snap_min)
+        else:
+            historical_min_price = slot_atl if slot_atl is not None else snap_min
+
+        pool_list = parse_gl_pool(item.get("gl_pool") or item.get("gl"))
+        item["latest_cheapest_price"] = prev_cheapest
+        item["latest_best_price"] = prev_best
+        item["all_time_low_price"] = slot_atl
+        item["last_alerted_price"] = _to_float(item.get("last_alerted_price"))
+        item["target_price"] = _to_float(item.get("target_price")) or 0.0
+        item["filter_config"] = item.get("filter_config") or {}
+        item["gl_pool"] = ",".join(pool_list)
+        item["last_winning_gl"] = str(item.get("last_winning_gl") or item.get("gl") or pool_list[0]).strip().upper()
+        item["historical_min_price"] = historical_min_price
+        item["prev_effective_price"] = prev_cheapest if prev_cheapest is not None else prev_best
+        item["last_atl_alerted_price"] = _to_float(item.get("last_atl_alerted_price"))
+        item["window_info"] = get_flight_window_status(item.get("outbound_date"), item.get("return_date"))
+        due_slots.append(item)
+
+    return {
+        "shard_index": shard_index,
+        "total_shards": total_shards,
+        "all_active_destinations": all_dest_rows,
+        "assigned_destinations": assigned_dests,
+        "due_slots": due_slots,
+    }
 
 
 # ==============================================================================
@@ -1182,13 +1524,13 @@ def record_price_snapshot(
     best_origin_airport: Optional[str] = None,
     best_destination_airport: Optional[str] = None,
     is_self_transfer: bool = False,
+    winning_gl: str = DEFAULT_GL,
     extraction_source: str = "patchright_dom",
     raw_top_offers: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
-    Persist a new dual-tab price snapshot including winning N:M airports
-    (`origin_airport`, `destination_airport`, `best_origin_airport`, `best_destination_airport`)
-    and atomically update the parent `date_slots` cached columns.
+    Persist a new dual-tab price snapshot including winning N:M airports and `winning_gl`
+    and atomically update the parent `date_slots` cached columns (`last_winning_gl`, `all_time_low_gl`).
     """
     cheapest_dec = Decimal(str(round(cheapest_tab_price, 2)))
     best_dec = Decimal(str(round(best_tab_price, 2))) if best_tab_price is not None else None
@@ -1196,6 +1538,7 @@ def record_price_snapshot(
     clean_dest = destination_airport.strip().upper()[:10] if destination_airport else None
     clean_best_orig = (best_origin_airport or origin_airport or "").strip().upper()[:10] or None
     clean_best_dest = (best_destination_airport or destination_airport or "").strip().upper()[:10] or None
+    clean_winning_gl = (winning_gl or DEFAULT_GL).strip().upper()[:8]
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -1204,6 +1547,7 @@ def record_price_snapshot(
                 """
                 SELECT
                     ds.all_time_low_price AS slot_all_time_low,
+                    ds.all_time_low_gl AS slot_all_time_low_gl,
                     ds.last_alerted_at,
                     ds.last_alerted_price,
                     ds.latest_cheapest_price AS prev_cheapest_price,
@@ -1260,9 +1604,9 @@ def record_price_snapshot(
                     origin_airport, destination_airport,
                     best_airline, best_stops, best_duration,
                     best_origin_airport, best_destination_airport,
-                    is_self_transfer, extraction_source, raw_top_offers
+                    is_self_transfer, winning_gl, extraction_source, raw_top_offers
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, scraped_at;
                 """,
                 (
@@ -1282,6 +1626,7 @@ def record_price_snapshot(
                     clean_best_orig,
                     clean_best_dest,
                     bool(is_self_transfer),
+                    clean_winning_gl,
                     extraction_source[:30],
                     Jsonb(raw_top_offers or []),
                 ),
@@ -1292,12 +1637,15 @@ def record_price_snapshot(
             snapshot_id = int(snap_inserted["id"])
             scraped_at = snap_inserted["scraped_at"]
 
-            # 3. Compute updated all-time low and update date_slots
-            new_all_time_low = (
-                min(historical_min_price, float(cheapest_dec))
-                if historical_min_price is not None
-                else float(cheapest_dec)
-            )
+            # 3. Compute updated all-time low & all_time_low_gl and update date_slots
+            if historical_min_price is None or float(cheapest_dec) <= historical_min_price:
+                new_all_time_low = float(cheapest_dec)
+                new_all_time_low_gl = clean_winning_gl
+            else:
+                new_all_time_low = historical_min_price
+                new_all_time_low_gl = (
+                    str(stats_row.get("slot_all_time_low_gl") or "").strip().upper()[:8] or None
+                )
 
             cur.execute(
                 """
@@ -1313,7 +1661,9 @@ def record_price_snapshot(
                     latest_best_origin_airport = %s,
                     latest_best_destination_airport = %s,
                     latest_is_self_transfer = %s,
-                    all_time_low_price = %s
+                    last_winning_gl = %s,
+                    all_time_low_price = %s,
+                    all_time_low_gl = %s
                 WHERE id = %s;
                 """,
                 (
@@ -1327,7 +1677,9 @@ def record_price_snapshot(
                     clean_best_orig,
                     clean_best_dest,
                     bool(is_self_transfer),
+                    clean_winning_gl,
                     Decimal(str(round(new_all_time_low, 2))),
+                    new_all_time_low_gl,
                     date_slot_id,
                 ),
             )
@@ -1341,14 +1693,171 @@ def record_price_snapshot(
     return {
         "snapshot_id": snapshot_id,
         "scraped_at": scraped_at,
+        "winning_gl": clean_winning_gl,
         "historical_min_price": historical_min_price,
         "new_all_time_low": new_all_time_low,
+        "new_all_time_low_gl": new_all_time_low_gl,
         "rolling_7d_avg": rolling_7d_avg,
         "rolling_7d_count": rolling_7d_count,
         "last_alerted_at": stats_row.get("last_alerted_at"),
         "last_alerted_price": _to_float(stats_row.get("last_alerted_price")),
         "prev_effective_price": prev_effective_price,
         "last_atl_alerted_price": _to_float(stats_row.get("last_atl_alerted_price")),
+    }
+
+
+def flush_shard_results_batch(
+    ram_results: Sequence[dict[str, Any]],
+    batch_started_at: datetime.datetime,
+    failed_slot_ids: Optional[Sequence[int]] = None,
+) -> dict[str, int]:
+    """
+    Phase 3 atomic batch flush for RAM-buffered scraping:
+      - Inserts all `price_snapshots` (preserving each slot's real `scraped_at` and `winning_gl`)
+      - Updates `date_slots` (`last_checked_at = batch_started_at`, `latest_*`, `last_winning_gl`,
+        `all_time_low_price`, `all_time_low_gl`)
+      - Updates `last_checked_at = batch_started_at` on any failed slots so they do not starve the queue.
+    Executes in a single PostgreSQL transaction.
+    """
+    if not ram_results and not failed_slot_ids:
+        return {"snapshots_inserted": 0, "slots_updated": 0, "failed_touched": 0}
+
+    if batch_started_at.tzinfo is None:
+        batch_ts = batch_started_at.replace(tzinfo=datetime.timezone.utc)
+    else:
+        batch_ts = batch_started_at
+
+    snap_params: list[tuple[Any, ...]] = []
+    slot_params: list[tuple[Any, ...]] = []
+
+    for item in ram_results:
+        slot_id = int(item["date_slot_id"])
+        dest_id = int(item["destination_id"])
+        cheapest_val = float(item["cheapest_tab_price"])
+        best_val = item.get("best_tab_price")
+        cheapest_dec = Decimal(str(round(cheapest_val, 2)))
+        best_dec = Decimal(str(round(float(best_val), 2))) if best_val is not None else None
+
+        clean_orig = str(item.get("origin_airport") or "").strip().upper()[:10] or None
+        clean_dest = str(item.get("destination_airport") or "").strip().upper()[:10] or None
+        clean_best_orig = (
+            str(item.get("best_origin_airport") or clean_orig or "").strip().upper()[:10] or None
+        )
+        clean_best_dest = (
+            str(item.get("best_destination_airport") or clean_dest or "").strip().upper()[:10] or None
+        )
+        clean_winning_gl = str(item.get("winning_gl") or DEFAULT_GL).strip().upper()[:8]
+        scraped_at = item.get("scraped_at") or datetime.datetime.now(datetime.timezone.utc)
+        if isinstance(scraped_at, datetime.datetime) and scraped_at.tzinfo is None:
+            scraped_at = scraped_at.replace(tzinfo=datetime.timezone.utc)
+
+        snap_params.append(
+            (
+                slot_id,
+                dest_id,
+                scraped_at,
+                cheapest_dec,
+                best_dec,
+                item.get("cheapest_airline"),
+                item.get("cheapest_stops"),
+                item.get("cheapest_duration"),
+                item.get("cheapest_dep_arr"),
+                clean_orig,
+                clean_dest,
+                item.get("best_airline"),
+                item.get("best_stops"),
+                item.get("best_duration"),
+                clean_best_orig,
+                clean_best_dest,
+                bool(item.get("is_self_transfer", False)),
+                clean_winning_gl,
+                str(item.get("extraction_source") or "patchright_dom")[:30],
+                Jsonb(item.get("raw_top_offers") or []),
+            )
+        )
+
+        slot_params.append(
+            (
+                batch_ts,
+                cheapest_dec,
+                best_dec,
+                item.get("cheapest_airline"),
+                item.get("cheapest_stops"),
+                item.get("cheapest_duration"),
+                clean_orig,
+                clean_dest,
+                clean_best_orig,
+                clean_best_dest,
+                bool(item.get("is_self_transfer", False)),
+                clean_winning_gl,
+                cheapest_dec,
+                cheapest_dec,
+                cheapest_dec,
+                clean_winning_gl,
+                slot_id,
+            )
+        )
+
+    clean_failed_ids = [int(sid) for sid in (failed_slot_ids or [])]
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if snap_params:
+                cur.executemany(
+                    """
+                    INSERT INTO price_snapshots (
+                        date_slot_id, destination_id, scraped_at,
+                        cheapest_tab_price, best_tab_price,
+                        cheapest_airline, cheapest_stops, cheapest_duration, cheapest_dep_arr,
+                        origin_airport, destination_airport,
+                        best_airline, best_stops, best_duration,
+                        best_origin_airport, best_destination_airport,
+                        is_self_transfer, winning_gl, extraction_source, raw_top_offers
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    """,
+                    snap_params,
+                )
+            if slot_params:
+                cur.executemany(
+                    """
+                    UPDATE date_slots
+                    SET last_checked_at = %s,
+                        latest_cheapest_price = %s,
+                        latest_best_price = %s,
+                        latest_airline = %s,
+                        latest_stops = %s,
+                        latest_duration = %s,
+                        latest_origin_airport = %s,
+                        latest_destination_airport = %s,
+                        latest_best_origin_airport = %s,
+                        latest_best_destination_airport = %s,
+                        latest_is_self_transfer = %s,
+                        last_winning_gl = %s,
+                        all_time_low_price = CASE
+                            WHEN all_time_low_price IS NULL THEN %s
+                            ELSE LEAST(all_time_low_price, %s)
+                        END,
+                        all_time_low_gl = CASE
+                            WHEN all_time_low_price IS NULL OR %s <= all_time_low_price THEN %s
+                            ELSE all_time_low_gl
+                        END
+                    WHERE id = %s;
+                    """,
+                    slot_params,
+                )
+            if clean_failed_ids:
+                cur.execute(
+                    "UPDATE date_slots SET last_checked_at = %s WHERE id = ANY(%s);",
+                    (batch_ts, clean_failed_ids),
+                )
+        conn.commit()
+    clear_db_cache()
+
+    return {
+        "snapshots_inserted": len(snap_params),
+        "slots_updated": len(slot_params),
+        "failed_touched": len(clean_failed_ids),
     }
 
 
@@ -1473,6 +1982,81 @@ def record_alert_and_update_slots(
                         """,
                         (effective_dec, int(slot_id)),
                     )
+        conn.commit()
+    clear_db_cache()
+    return log_ids
+
+
+def record_alerts_batch(
+    alert_batches: Sequence[dict[str, Any]],
+) -> list[int]:
+    """
+    Phase 3 batch persistence of `alert_logs` and `date_slots` alert state across
+    all destinations in a shard in a single PostgreSQL transaction.
+    Each item in `alert_batches` has: `destination_id`, `triggered_slots`, `message_preview`.
+    """
+    if not alert_batches:
+        return []
+
+    log_params: list[tuple[Any, ...]] = []
+    slot_updates: list[tuple[Any, int]] = []
+
+    for batch in alert_batches:
+        dest_id = int(batch["destination_id"])
+        message_preview = str(batch.get("message_preview") or "")[:1500]
+        for item in batch.get("triggered_slots") or []:
+            slot_id = item.get("date_slot_id")
+            trigger_type = str(item.get("trigger_type", "TARGET_BREACH"))
+            cheapest_price = item.get("cheapest_tab_price")
+            best_price = item.get("best_tab_price")
+            cheapest_dec = (
+                Decimal(str(round(float(cheapest_price), 2)))
+                if cheapest_price is not None
+                else None
+            )
+            best_dec = (
+                Decimal(str(round(float(best_price), 2)))
+                if best_price is not None
+                else None
+            )
+            log_params.append(
+                (dest_id, slot_id, trigger_type, cheapest_dec, best_dec, message_preview)
+            )
+            effective_dec = cheapest_dec if cheapest_dec is not None else best_dec
+            if slot_id is not None and effective_dec is not None:
+                slot_updates.append((effective_dec, int(slot_id)))
+
+    if not log_params and not slot_updates:
+        return []
+
+    log_ids: list[int] = []
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            for lp in log_params:
+                cur.execute(
+                    """
+                    INSERT INTO alert_logs (
+                        destination_id, date_slot_id, trigger_type,
+                        cheapest_price, best_price, message_preview
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    lp,
+                )
+                row = cur.fetchone()
+                if row:
+                    log_ids.append(int(row["id"]))
+            if slot_updates:
+                cur.executemany(
+                    """
+                    UPDATE date_slots
+                    SET last_alerted_at = NOW(),
+                        last_alerted_price = %s
+                    WHERE id = %s;
+                    """,
+                    slot_updates,
+                )
         conn.commit()
     clear_db_cache()
     return log_ids

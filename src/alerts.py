@@ -1,24 +1,23 @@
 """
-Consolidated Destination Digest Alert Engine (`src/alerts.py`) for FlightPulse Matrix v4.0.
+Consolidated Destination Digest Alert Engine (`src/alerts.py`) for FlightPulse Matrix v5.0.
 
 Features:
   - Strict 330-day window filtering: excludes `FUTURE_RELEASE` slots before evaluating
     triggers or rendering Telegram messages.
   - Evaluates only 2 high-signal triggers using `effective_price = cheapest_price or best_price`:
-      1. TARGET_BREACH (Meta): immediate alert (bypasses cooldown) on first breach or
-         when crossing down from above `target_price`; while remaining under target,
-         re-alerts only on >=3% extra drop (respecting `cooldown_hours`) or >=5% extra
-         drop (bypassing cooldown).
+      1. TARGET_BREACH (Meta): fires when `target_price > 0` and `effective_price <= target_price`
+         on first breach, crossing down from above `target_price` (`prev_effective_price > target_price`),
+         or additional >=3% drop vs `last_alerted_price`.
       2. ALL_TIME_LOW (Bajo Histórico): requires prior DB history (`historical_min_price`
-         not None), uses `reference_low = last_atl_alerted_price or historical_min_price`,
-         fires on >=2% drop (`effective_price <= reference_low * 0.98`), and always
-         bypasses `cooldown_hours`.
-  - Sends ONE compact HTML Telegram message per destination (`parse_mode="HTML"`).
+         not None) and `effective_price < historical_min_price`, uses
+         `reference_low = last_atl_alerted_price or historical_min_price`, and fires on
+         >=2% drop (`effective_price <= reference_low * 0.98`).
+  - Sends ONE compact HTML Telegram message per destination (`parse_mode="HTML"`) with
+    clean `[Reservar]` links pointing dynamically to `gl=winning_gl` and `tfu=CHEAPEST_TFU`.
 """
 
 from __future__ import annotations
 
-import datetime
 import html
 import logging
 import re
@@ -146,7 +145,6 @@ def evaluate_slot_alert_triggers(
         return None
 
     target_price = float(slot_meta.get("target_price") or 0.0)
-    cooldown_hours = int(slot_meta.get("cooldown_hours") or 12)
     filter_cfg = slot_meta.get("filter_config") or {}
 
     is_self_transfer = bool(scrape_result.get("is_self_transfer", False))
@@ -175,30 +173,23 @@ def evaluate_slot_alert_triggers(
         else slot_meta.get("last_atl_alerted_price")
     )
 
-    elapsed_hours = float("inf")
-    if last_alerted_at is not None:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if last_alerted_at.tzinfo is None:
-            last_alerted_at = last_alerted_at.replace(tzinfo=datetime.timezone.utc)
-        elapsed_hours = (now_utc - last_alerted_at).total_seconds() / 3600.0
-
     triggers: list[str] = []
 
     # 1. TARGET_BREACH (Meta)
     if target_price > 0 and effective_price <= target_price:
-        never_alerted = last_alerted_at is None or last_alerted_price is None
+        never_alerted_target = (
+            last_alerted_at is None
+            or last_alerted_price is None
+            or float(last_alerted_price) > target_price
+        )
         crossed_below = prev_effective is not None and float(prev_effective) > target_price
-        if never_alerted or crossed_below:
+        if never_alerted_target or crossed_below:
             triggers.append("TARGET_BREACH")
-        elif float(last_alerted_price) > 0:
-            last_p = float(last_alerted_price)
-            if effective_price <= last_p * 0.95:
-                triggers.append("TARGET_BREACH")
-            elif effective_price <= last_p * 0.97 and elapsed_hours >= cooldown_hours:
-                triggers.append("TARGET_BREACH")
+        elif float(last_alerted_price) > 0 and effective_price <= float(last_alerted_price) * 0.97:
+            triggers.append("TARGET_BREACH")
 
-    # 2. ALL_TIME_LOW (Bajo Histórico — always bypasses cooldown_hours)
-    if historical_min is not None and float(historical_min) > 0:
+    # 2. ALL_TIME_LOW (Bajo Histórico)
+    if historical_min is not None and float(historical_min) > 0 and effective_price < float(historical_min):
         reference_low = (
             float(last_atl_alerted_price)
             if (last_atl_alerted_price is not None and float(last_atl_alerted_price) > 0)
@@ -210,12 +201,20 @@ def evaluate_slot_alert_triggers(
     if not triggers:
         return None
 
+    winning_gl = str(
+        scrape_result.get("winning_gl")
+        or scrape_result.get("gl")
+        or slot_meta.get("last_winning_gl")
+        or DEFAULT_GL
+    ).strip().upper()
+
     return {
         "date_slot_id": slot_meta.get("id"),
         "label": slot_meta.get("label") or f"{slot_meta.get('outbound_date')} -> {slot_meta.get('return_date')}",
         "outbound_date": slot_meta.get("outbound_date"),
         "return_date": slot_meta.get("return_date"),
         "google_flights_url": slot_meta.get("google_flights_url"),
+        "winning_gl": winning_gl,
         "cheapest_tab_price": cheapest_price,
         "cheapest_airline": scrape_result.get("cheapest_airline") or "Aerolínea",
         "cheapest_stops": scrape_result.get("cheapest_stops") or "Directo",
@@ -315,9 +314,14 @@ def format_consolidated_destination_digest(
             lines.append(f"Mejor: ${float(b_price):,.0f} {currency} ({b_route}{b_stops}, {b_dur})")
 
         raw_url = str(slot.get("google_flights_url") or "https://www.google.com/travel/flights").strip()
-        dest_gl = str(destination_meta.get("gl") or DEFAULT_GL).strip().upper()
+        winning_gl = str(
+            slot.get("winning_gl")
+            or slot.get("last_winning_gl")
+            or destination_meta.get("gl")
+            or DEFAULT_GL
+        ).strip().upper()
         try:
-            booking_url = normalize_flights_url(raw_url, tfu=CHEAPEST_TFU, gl=dest_gl)
+            booking_url = normalize_flights_url(raw_url, tfu=CHEAPEST_TFU, gl=winning_gl)
         except Exception:
             booking_url = raw_url
         escaped_url = html.escape(booking_url, quote=True)
@@ -473,6 +477,7 @@ def send_test_digest_alert(destination_id: Optional[int] = None) -> tuple[bool, 
                 "outbound_date": s.get("outbound_date"),
                 "return_date": s.get("return_date"),
                 "google_flights_url": s.get("google_flights_url") or "https://www.google.com/travel/flights",
+                "winning_gl": str(s.get("last_winning_gl") or dest_meta.get("gl") or DEFAULT_GL).strip().upper(),
                 "cheapest_tab_price": c_price,
                 "cheapest_stops": s.get("latest_stops") or "Directo",
                 "cheapest_duration": s.get("latest_duration") or "N/A",

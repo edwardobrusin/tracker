@@ -30,6 +30,9 @@ from src.alerts import (
     format_consolidated_destination_digest,
 )
 from src.config import (
+    DEFAULT_CHECK_INTERVAL_MINUTES,
+    DEFAULT_GL_POOL,
+    DUE_GRACE_MINUTES,
     MAX_DESTINATIONS,
     MAX_SLOTS_PER_RUN,
     MAX_TOTAL_SLOTS,
@@ -38,26 +41,37 @@ from src.config import (
     get_proxy_pool,
     get_proxy_tier,
     interleave_proxies_by_account,
+    parse_gl_pool,
     redact_account_for_log,
     redact_proxy_for_log,
     sanitize_log_text,
 )
 from src.ds1_parser import FlightOffer
-from src.runner import ProxyCircuitBreaker
-from src.scraper import PooledPatchrightSession, consolidate_slot_offers
+from src.runner import ProxyCircuitBreaker, assign_destinations_to_shard, run_sharded_dispatcher
+from src.scraper import (
+    PooledPatchrightSession,
+    SlotScrapeResult,
+    consolidate_slot_offers,
+    scrape_date_slot_multi_gl,
+)
 from src.db import (
     bulk_create_date_slots,
     clear_db_cache,
+    close_db_connection,
     connection_stats,
     create_destination,
     delete_destination,
+    flush_shard_results_batch,
     get_connection,
     get_dashboard_summary,
+    get_date_slot,
     get_recent_alert_logs,
     get_snapshots_for_destination,
     init_db,
+    is_db_connected,
     list_date_slots,
     list_destinations,
+    partition_destinations_into_shards,
     reset_connection_stats,
     set_destination_active,
     update_destination,
@@ -448,10 +462,13 @@ def bench_10_scraper_parser_and_db_integrity() -> None:
         parsed_mxn = _parse_single_itinerary_entry(mock_mxn_entry, expected_currency="MXN")
         assert parsed_mxn is not None and parsed_mxn.price == 5673.0
 
-        # 6. Verify 20x10 capacity expansion defaults
-        assert MAX_DESTINATIONS == 20, f"Expected MAX_DESTINATIONS=20, got {MAX_DESTINATIONS}"
-        assert MAX_TOTAL_SLOTS == 200, f"Expected MAX_TOTAL_SLOTS=200, got {MAX_TOTAL_SLOTS}"
-        assert MAX_SLOTS_PER_RUN >= 40, f"Expected MAX_SLOTS_PER_RUN>=40, got {MAX_SLOTS_PER_RUN}"
+        # 6. Verify 50x10 capacity expansion defaults & hourly cadence
+        assert MAX_DESTINATIONS == 50, f"Expected MAX_DESTINATIONS=50, got {MAX_DESTINATIONS}"
+        assert MAX_TOTAL_SLOTS == 500, f"Expected MAX_TOTAL_SLOTS=500, got {MAX_TOTAL_SLOTS}"
+        assert MAX_SLOTS_PER_RUN == 500, f"Expected MAX_SLOTS_PER_RUN=500, got {MAX_SLOTS_PER_RUN}"
+        assert DEFAULT_CHECK_INTERVAL_MINUTES == 60, f"Expected 60m interval, got {DEFAULT_CHECK_INTERVAL_MINUTES}"
+        assert DUE_GRACE_MINUTES == 5, f"Expected DUE_GRACE_MINUTES=5, got {DUE_GRACE_MINUTES}"
+        assert DEFAULT_GL_POOL == ("MX", "IT", "DE")
 
         # 7. Verify DB contains 0 corrupted 1839 or 307 rows
         with get_connection() as conn:
@@ -581,7 +598,7 @@ def bench_12_proxy_rotation_and_circuit_breaker() -> None:
 
 
 def bench_13_alert_triggers_meta_and_low() -> None:
-    """Verify 2-trigger alert engine (Meta & Bajo Histórico), no SHARP_DROP, and FUTURE_RELEASE exclusion."""
+    """Verify 2-trigger alert engine (Meta & Bajo Histórico) without cooldown_hours, and FUTURE_RELEASE exclusion."""
     def _trigger_tests() -> str:
         today = datetime.date.today()
         active_out = (today + datetime.timedelta(days=45)).strftime("%Y-%m-%d")
@@ -597,7 +614,7 @@ def bench_13_alert_triggers_meta_and_low() -> None:
             "return_date": active_ret,
             "google_flights_url": "https://www.google.com/travel/flights?tfs=test",
             "target_price": 10000.0,
-            "cooldown_hours": 12,
+            "last_winning_gl": "IT",
             "filter_config": {},
         }
 
@@ -606,7 +623,7 @@ def bench_13_alert_triggers_meta_and_low() -> None:
         assert (
             evaluate_slot_alert_triggers(
                 fut_slot,
-                {"cheapest_tab_price": 5000.0, "best_tab_price": 6000.0},
+                {"cheapest_tab_price": 5000.0, "best_tab_price": 6000.0, "winning_gl": "IT"},
                 {"historical_min_price": 15000.0},
             )
             is None
@@ -623,24 +640,24 @@ def bench_13_alert_triggers_meta_and_low() -> None:
         # 3. TARGET_BREACH (Meta): immediate on first breach & on crossing down from > target
         t1 = evaluate_slot_alert_triggers(
             base_slot,
-            {"cheapest_tab_price": 9900.0, "best_tab_price": 10500.0},
+            {"cheapest_tab_price": 9900.0, "best_tab_price": 10500.0, "winning_gl": "IT"},
             {"historical_min_price": None, "last_alerted_at": None, "last_alerted_price": None},
         )
-        assert t1 is not None and t1["trigger_type"] == "TARGET_BREACH"
+        assert t1 is not None and t1["trigger_type"] == "TARGET_BREACH" and t1["winning_gl"] == "IT"
 
         t_cross = evaluate_slot_alert_triggers(
             base_slot,
-            {"cheapest_tab_price": 9900.0, "best_tab_price": None},
+            {"cheapest_tab_price": 9900.0, "best_tab_price": None, "winning_gl": "DE"},
             {
                 "historical_min_price": None,
-                "last_alerted_at": now_utc - datetime.timedelta(hours=1),
+                "last_alerted_at": now_utc - datetime.timedelta(minutes=30),
                 "last_alerted_price": 9800.0,
                 "prev_effective_price": 10200.0,
             },
         )
-        assert t_cross is not None and t_cross["trigger_type"] == "TARGET_BREACH"
+        assert t_cross is not None and t_cross["trigger_type"] == "TARGET_BREACH" and t_cross["winning_gl"] == "DE"
 
-        # Staying below target: <3% extra drop blocked; >=3% needs cooldown; >=5% bypasses cooldown
+        # Staying below target: <3% extra drop blocked; >=3% fires immediately with zero cooldown_hours
         assert (
             evaluate_slot_alert_triggers(
                 base_slot,
@@ -654,47 +671,20 @@ def bench_13_alert_triggers_meta_and_low() -> None:
             )
             is None
         )
-        assert (
-            evaluate_slot_alert_triggers(
-                base_slot,
-                {"cheapest_tab_price": 9650.0, "best_tab_price": 10000.0},
-                {
-                    "historical_min_price": 9900.0,
-                    "last_alerted_at": now_utc - datetime.timedelta(hours=2),
-                    "last_alerted_price": 10000.0,
-                    "prev_effective_price": 9900.0,
-                    "last_atl_alerted_price": 9700.0,
-                },
-            )
-            is None
-        )
-        t_3pct_after_cd = evaluate_slot_alert_triggers(
+        t_3pct_immediate = evaluate_slot_alert_triggers(
             base_slot,
             {"cheapest_tab_price": 9650.0, "best_tab_price": 10000.0},
             {
                 "historical_min_price": 9900.0,
-                "last_alerted_at": now_utc - datetime.timedelta(hours=13),
+                "last_alerted_at": now_utc - datetime.timedelta(minutes=15),
                 "last_alerted_price": 10000.0,
                 "prev_effective_price": 9900.0,
                 "last_atl_alerted_price": 9700.0,
             },
         )
-        assert t_3pct_after_cd is not None and t_3pct_after_cd["trigger_type"] == "TARGET_BREACH"
+        assert t_3pct_immediate is not None and t_3pct_immediate["trigger_type"] == "TARGET_BREACH"
 
-        t_5pct_bypass = evaluate_slot_alert_triggers(
-            base_slot,
-            {"cheapest_tab_price": 9500.0, "best_tab_price": 10000.0},
-            {
-                "historical_min_price": 9900.0,
-                "last_alerted_at": now_utc - datetime.timedelta(hours=1),
-                "last_alerted_price": 10000.0,
-                "prev_effective_price": 9900.0,
-                "last_atl_alerted_price": 9600.0,
-            },
-        )
-        assert t_5pct_bypass is not None and t_5pct_bypass["trigger_type"] == "TARGET_BREACH"
-
-        # 4. ALL_TIME_LOW (Bajo Histórico): requires >=2% drop vs reference_low and bypasses cooldown
+        # 4. ALL_TIME_LOW (Bajo Histórico): requires < historical_min_price and <= reference_low * 0.98
         assert (
             evaluate_slot_alert_triggers(
                 base_slot,
@@ -726,7 +716,27 @@ def bench_13_alert_triggers_meta_and_low() -> None:
         )
         assert t_fallback is not None and t_fallback["effective_price"] == 9800.0
 
-        return "Meta + Bajo Histórico + no SHARP_DROP + FUTURE_RELEASE guard OK"
+        # 6. Total absence of cooldown_hours in core modules & UI
+        for rel_path in (
+            "src/config.py",
+            "src/db.py",
+            "src/alerts.py",
+            "src/runner.py",
+            "app.py",
+            "scripts/simulate_alert_triggers.py",
+        ):
+            src_text = (ROOT_DIR / rel_path).read_text(encoding="utf-8")
+            if rel_path == "src/db.py":
+                # Only allowed in idempotent DROP COLUMN IF EXISTS migration
+                non_drop_lines = [
+                    ln for ln in src_text.splitlines()
+                    if "cooldown_hours" in ln and "DROP COLUMN IF EXISTS cooldown_hours" not in ln
+                ]
+                assert not non_drop_lines, f"Unexpected cooldown_hours in {rel_path}: {non_drop_lines}"
+            else:
+                assert "cooldown_hours" not in src_text, f"cooldown_hours still present in {rel_path}"
+
+        return "Meta + Bajo Histórico + 0 cooldown_hours + FUTURE_RELEASE guard OK"
 
     measure("13. unit_alert_triggers_meta_low", _trigger_tests)
 
@@ -1567,18 +1577,19 @@ def bench_23_normalize_flights_url_and_reservar() -> None:
         assert qs_keep["tfu"] == [CHEAPEST_TFU]
         assert qs_keep["tfs"] == orig_qs["tfs"]
 
-        # Verify Telegram [Reservar] renders with CHEAPEST_TFU + destination gl
+        # Verify Telegram [Reservar] renders clean text (no "(IT)" suffix) with CHEAPEST_TFU + slot winning_gl
         today = datetime.date.today()
         out_d = (today + datetime.timedelta(days=40)).strftime("%Y-%m-%d")
         ret_d = (today + datetime.timedelta(days=50)).strftime("%Y-%m-%d")
         msg_html = format_consolidated_destination_digest(
-            {"id": 13, "name": "Conexión Europa", "origin": "MEX,NLU", "destination": "MXP", "currency": "MXN", "gl": "IT"},
+            {"id": 13, "name": "Conexión Europa", "origin": "MEX,NLU", "destination": "MXP", "currency": "MXN", "gl": "MX"},
             [
                 {
                     "label": "Sáb 11 Sep - Dom 27 Sep",
                     "outbound_date": out_d,
                     "return_date": ret_d,
                     "google_flights_url": orig_url,
+                    "winning_gl": "IT",
                     "cheapest_tab_price": 15951.0,
                     "cheapest_stops": "2 escalas",
                     "cheapest_duration": "38 h 25 min",
@@ -1590,7 +1601,9 @@ def bench_23_normalize_flights_url_and_reservar() -> None:
         )
         assert f"tfu={CHEAPEST_TFU}" in msg_html and "gl=IT" in msg_html
         assert f"tfs={orig_qs['tfs'][0]}" in msg_html
-        return "normalize_flights_url + Telegram [Reservar] tfu/gl OK"
+        assert "><b>[Reservar]</b></a>" in msg_html
+        assert "(IT)" not in msg_html and "[Reservar] (" not in msg_html
+        return "normalize_flights_url + clean Telegram [Reservar] tfu/winning_gl OK"
 
     measure("23. unit_normalize_url_and_reservar", _url_and_reservar_test)
 
@@ -1712,6 +1725,250 @@ def bench_25_sectioned_top_vs_other_extraction() -> None:
     measure("25. unit_sectioned_top_vs_other", _section_test)
 
 
+def bench_26_sharding_6_shards_and_10_destinations() -> None:
+    """Verify assign_destinations_to_shard across 10 destinations and 6 shards (0 overlap, 100% coverage, balanced)."""
+    def _shard_test() -> str:
+        dests = [
+            {"id": idx + 1, "name": f"Dest_{idx+1}", "active_slot_count": cnt}
+            for idx, cnt in enumerate([10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+        ]
+        all_assigned_ids: list[int] = []
+        loads: list[int] = []
+        for s_idx in range(6):
+            bucket = assign_destinations_to_shard(dests, shard_index=s_idx, total_shards=6)
+            all_assigned_ids.extend(int(d["id"]) for d in bucket)
+            loads.append(sum(int(d["active_slot_count"]) for d in bucket))
+
+        assert len(all_assigned_ids) == 10, f"Expected 10 total assignments, got {len(all_assigned_ids)}"
+        assert len(set(all_assigned_ids)) == 10, "Overlap detected across shards!"
+        assert set(all_assigned_ids) == {d["id"] for d in dests}, "Missing destination in shard coverage"
+
+        # Deterministic regardless of input order
+        reversed_shards = partition_destinations_into_shards(list(reversed(dests)), total_shards=6)
+        forward_shards = partition_destinations_into_shards(dests, total_shards=6)
+        assert [[d["id"] for d in b] for b in reversed_shards] == [[d["id"] for d in b] for b in forward_shards]
+        # Greedy LPT balance for [10..1] across 6 shards -> max=10, min=8
+        assert max(loads) - min(loads) <= 3, f"Unbalanced loads across 6 shards: {loads}"
+        return f"10 dests -> 6 shards: 0 overlaps, 100% coverage, loads={loads}"
+
+    measure("26. unit_sharding_10dest_6shards", _shard_test)
+
+
+def bench_27_multi_gl_competition_and_tiebreak() -> None:
+    """Verify Multi-GL (MX, IT, DE) selects lowest price, breaks ties by pool order, and tolerates 1/3 GL failures."""
+    def _multi_gl_test() -> str:
+        import logging as _logging
+        import src.scraper as _scraper_mod
+
+        orig_scrape = _scraper_mod.scrape_date_slot
+        log_records: list[str] = []
+
+        class _MemHandler(_logging.Handler):
+            def emit(self, record: _logging.LogRecord) -> None:
+                log_records.append(self.format(record))
+
+        handler = _MemHandler()
+        _scraper_mod.logger.addHandler(handler)
+        prev_level = _scraper_mod.logger.level
+        _scraper_mod.logger.setLevel(_logging.INFO)
+
+        try:
+            def _make_res(price: float, best_price: float, gl_code: str) -> SlotScrapeResult:
+                return SlotScrapeResult(
+                    cheapest_tab_price=price,
+                    cheapest_airline="Air Canada",
+                    cheapest_stops="2 escalas",
+                    cheapest_duration="38 h 25 min",
+                    cheapest_dep_arr="11:55 - 10:20",
+                    is_self_transfer=False,
+                    origin_airport="MEX",
+                    destination_airport="MXP",
+                    best_tab_price=best_price,
+                    gl=gl_code,
+                    winning_gl=gl_code,
+                )
+
+            # Case 1: IT wins lowest absolute price ($15,953 vs MX=$16,201, DE=$16,153)
+            prices_case1 = {"MX": (16201.0, 18052.0), "IT": (15953.0, 18052.0), "DE": (16153.0, 18052.0)}
+            _scraper_mod.scrape_date_slot = lambda url, pooled_session=None, proxy_url=None, date_range_label="", gl=None: _make_res(  # type: ignore[assignment]
+                prices_case1[gl][0], prices_case1[gl][1], gl
+            )
+            win1 = scrape_date_slot_multi_gl(
+                "https://www.google.com/travel/flights/search?tfs=abc",
+                gl_pool=("MX", "IT", "DE"),
+                date_range_label="2027-09-11 -> 2027-09-27",
+                inter_gl_delay=(0.0, 0.0),
+            )
+            assert win1 is not None
+            assert win1.winning_gl == "IT" and win1.cheapest_tab_price == 15953.0
+            assert any(
+                "[2027-09-11 -> 2027-09-27] multi_gl: MX=$16,201 | IT=$15,953 | DE=$16,153 -> winner=IT ($15,953, Best=$18,052)" in m
+                for m in log_records
+            ), f"Expected compact multi_gl log line, got: {log_records}"
+
+            # Case 2: Exact tie -> first market in pool (MX) wins
+            prices_tie = {"MX": (17753.0, 18500.0), "IT": (17753.0, 18200.0), "DE": (18100.0, 18500.0)}
+            _scraper_mod.scrape_date_slot = lambda url, pooled_session=None, proxy_url=None, date_range_label="", gl=None: _make_res(  # type: ignore[assignment]
+                prices_tie[gl][0], prices_tie[gl][1], gl
+            )
+            win2 = scrape_date_slot_multi_gl(
+                "https://www.google.com/travel/flights/search?tfs=abc",
+                gl_pool=["MX", "IT", "DE", "MX"],  # Also verifies deduplication
+                date_range_label="2027-07-31 -> 2027-08-15",
+                inter_gl_delay=(0.0, 0.0),
+            )
+            assert win2 is not None and win2.winning_gl == "MX" and win2.cheapest_tab_price == 17753.0
+
+            # Case 3: 1 of 3 GLs fails -> still returns winner from remaining GLs
+            def _partial_fail(url: str, pooled_session: Any = None, proxy_url: Any = None, date_range_label: str = "", gl: Any = None) -> Optional[SlotScrapeResult]:
+                if gl == "IT":
+                    raise RuntimeError("Transient timeout on IT")
+                if gl == "MX":
+                    return _make_res(16500.0, 18000.0, "MX")
+                return _make_res(16150.0, 17900.0, "DE")
+
+            _scraper_mod.scrape_date_slot = _partial_fail  # type: ignore[assignment]
+            win3 = scrape_date_slot_multi_gl(
+                "https://www.google.com/travel/flights/search?tfs=abc",
+                gl_pool=("MX", "IT", "DE"),
+                date_range_label="2027-09-11 -> 2027-09-27",
+                inter_gl_delay=(0.0, 0.0),
+            )
+            assert win3 is not None and win3.winning_gl == "DE" and win3.cheapest_tab_price == 16150.0
+        finally:
+            _scraper_mod.scrape_date_slot = orig_scrape
+            _scraper_mod.logger.removeHandler(handler)
+            _scraper_mod.logger.setLevel(prev_level)
+
+        return "Multi-GL IT min + MX tie-break + 1/3 GL fault tolerance OK"
+
+    measure("27. unit_multi_gl_competition", _multi_gl_test)
+
+
+def bench_28_ram_buffer_neon_sleep_and_flush() -> None:
+    """Verify Neon disconnects before Phase 2 scraping (0 DB calls in Phase 2) and Phase 3 flush updates timestamps & GLs."""
+    def _ram_buffer_test() -> str:
+        import src.runner as _runner_mod
+
+        init_db()
+        unique_name = f"__RamBufferTest_{int(time.time() * 1000)}"
+        temp_dest_id: Optional[int] = None
+
+        orig_get_proxy_pool = _runner_mod.get_proxy_pool
+        orig_session_cls = _runner_mod.PooledPatchrightSession
+        orig_multi_gl = _runner_mod.scrape_date_slot_multi_gl
+        orig_send_tg = _runner_mod.send_telegram_message
+
+        class _DummySession:
+            def __init__(self, proxy_url: Optional[str] = None, headless: bool = True) -> None:
+                self.proxy_url = proxy_url
+
+            def start(self) -> "_DummySession":
+                return self
+
+            def reset_for_new_destination(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        phase2_assertions: dict[str, Any] = {}
+
+        try:
+            temp_dest_id = create_destination(
+                name=unique_name,
+                origin="MEX",
+                destination="MXP",
+                target_price=16500.0,
+                gl_pool=["MX", "IT", "DE"],
+                is_active=False,
+            )
+            today = datetime.date.today()
+            out_d = (today + datetime.timedelta(days=45)).strftime("%Y-%m-%d")
+            ret_d = (today + datetime.timedelta(days=55)).strftime("%Y-%m-%d")
+            slot_ids = bulk_create_date_slots(
+                temp_dest_id,
+                [
+                    {
+                        "label": format_date_slot_label(out_d, ret_d),
+                        "outbound_date": out_d,
+                        "return_date": ret_d,
+                        "google_flights_url": build_google_flights_url("MEX", "MXP", out_d, ret_d),
+                    }
+                ],
+            )
+            slot_id = slot_ids[0]
+
+            _runner_mod.get_proxy_pool = lambda **kwargs: [None]  # type: ignore[assignment]
+            _runner_mod.PooledPatchrightSession = _DummySession  # type: ignore[assignment,misc]
+            _runner_mod.send_telegram_message = lambda html_text: (True, "OK_MOCK")  # type: ignore[assignment]
+
+            def _mock_multi_gl(url: str, gl_pool: Any = None, pooled_session: Any = None, proxy_url: Any = None, date_range_label: str = "") -> SlotScrapeResult:
+                phase2_assertions["db_connected_during_scrape"] = is_db_connected()
+                phase2_assertions["stats_during_scrape"] = connection_stats()
+                return SlotScrapeResult(
+                    cheapest_tab_price=15953.0,
+                    cheapest_airline="Air Canada",
+                    cheapest_stops="2 escalas",
+                    cheapest_duration="38 h 25 min",
+                    cheapest_dep_arr="11:55 - 10:20",
+                    is_self_transfer=False,
+                    origin_airport="MEX",
+                    destination_airport="MXP",
+                    best_tab_price=18052.0,
+                    best_airline="Lufthansa",
+                    best_stops="1 escala",
+                    best_duration="15 h 10 min",
+                    best_origin_airport="MEX",
+                    best_destination_airport="MXP",
+                    gl="IT",
+                    winning_gl="IT",
+                )
+
+            _runner_mod.scrape_date_slot_multi_gl = _mock_multi_gl  # type: ignore[assignment]
+
+            summary = run_sharded_dispatcher(
+                max_slots=1,
+                force_all=True,
+                slot_id=slot_id,
+                shard_index=0,
+                total_shards=1,
+            )
+            assert summary["scraped_ok"] == 1
+            assert summary["alerts_sent"] == 1
+            assert phase2_assertions.get("db_connected_during_scrape") is False, "DB MUST be disconnected during Phase 2!"
+            assert is_db_connected() is False, "DB MUST be disconnected when dispatcher exits!"
+
+            updated_slot = get_date_slot(slot_id)
+            assert updated_slot is not None
+            assert updated_slot["last_winning_gl"] == "IT"
+            assert updated_slot["all_time_low_gl"] == "IT"
+            assert float(updated_slot["all_time_low_price"]) == 15953.0
+            assert updated_slot["last_checked_at"] is not None
+
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT winning_gl, cheapest_tab_price FROM price_snapshots WHERE date_slot_id = %s;",
+                        (slot_id,),
+                    )
+                    snap_row = cur.fetchone()
+                    assert snap_row is not None and snap_row["winning_gl"] == "IT"
+                    assert float(snap_row["cheapest_tab_price"]) == 15953.0
+        finally:
+            _runner_mod.get_proxy_pool = orig_get_proxy_pool
+            _runner_mod.PooledPatchrightSession = orig_session_cls
+            _runner_mod.scrape_date_slot_multi_gl = orig_multi_gl
+            _runner_mod.send_telegram_message = orig_send_tg
+            if temp_dest_id is not None:
+                delete_destination(temp_dest_id)
+            close_db_connection()
+
+        return "Phase 1 disconnect + Phase 2 0-DB RAM + Phase 3 flush (winning_gl/ATL_gl) OK"
+
+    measure("28. integration_ram_buffer_flush", _ram_buffer_test)
+
+
 def print_summary_table() -> None:
     print("\n" + "=" * 108)
     print(f"{'ACTION':<38} | {'TIME (ms)':>10} | {'SQL':>5} | {'CONNS':>5} | {'STATUS':<6} | {'DETAIL'}")
@@ -1751,6 +2008,9 @@ def main() -> int:
     bench_23_normalize_flights_url_and_reservar()
     bench_24_direct_cheapest_wait_and_hidden_text()
     bench_25_sectioned_top_vs_other_extraction()
+    bench_26_sharding_6_shards_and_10_destinations()
+    bench_27_multi_gl_competition_and_tiebreak()
+    bench_28_ram_buffer_neon_sleep_and_flush()
     print_summary_table()
     return 0
 

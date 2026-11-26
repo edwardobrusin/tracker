@@ -1,56 +1,86 @@
 """
-Sharded Anti-Ban Queue Dispatcher (`src/runner.py`) for FlightPulse Matrix v4.0.
+Sharded Anti-Ban Queue Dispatcher (`src/runner.py`) for FlightPulse Matrix v5.0.
 
-Responsibilities:
-  1. Never scrapes all 200 date slots in a single burst.
-  2. Queries up to `max_slots` due `date_slots` ordered by `last_checked_at ASC NULLS FIRST`.
-  3. Prioritizes zero-cost network channels strictly:
-       Nivel 1: Cloudflare WARP (`SOCKS5_PROXY`)
-       Nivel 2: Direct (`None`)
-       Nivel 3: `PROXY_LIST` (Webshare, interleaved across accounts with random run offset)
-  4. Enforces a per-account circuit breaker (`ProxyCircuitBreaker`): HTTP 402/407, quota/auth
-     errors, or 3 consecutive tunnel failures mark the entire account in `exhausted_accounts`
-     and log `[PROXY_EXHAUSTED] account=<user>`.
-  5. Pools a single `patchright` browser instance per active channel, resetting cookies
-     between destinations, and emits `(tier, network_channel)` telemetry at run completion.
+Architecture (Strict 3-Phase RAM-Buffered Execution):
+  - Phase 1 (Single Read & Disconnect — ~1s):
+      Captures `batch_started_at`, runs `init_db()` (protected by PostgreSQL advisory lock),
+      calls `fetch_shard_due_work_package(...)` to deterministically partition active
+      destinations into `total_shards` disjoint buckets via `assign_destinations_to_shard`,
+      and immediately calls `close_db_connection()` (`[NEON_SLEEP]`) so Neon compute can sleep.
+  - Phase 2 (100% In-RAM Multi-GL Scraping — 0 DB calls):
+      Competes each due slot across `gl_pool` (e.g. MX, IT, DE) via `scrape_date_slot_multi_gl`,
+      reusing a single `PooledPatchrightSession` and prioritizing Nivel 1 (WARP) -> Nivel 2
+      (Direct) -> Nivel 3 (Interleaved Proxy Pool). Accumulates winners in `ram_results`.
+      Registers SIGTERM/SIGINT handlers + `try ... finally` so partial RAM buffers always flush.
+  - Phase 3 (Atomic Batch Flush + Consolidated Alerts + Close — ~2s):
+      Reconnects once to Neon, flushes `price_snapshots` and `date_slots` (`last_checked_at =
+      batch_started_at`, `winning_gl`, `last_winning_gl`, `all_time_low_gl`) via
+      `flush_shard_results_batch`, evaluates triggers against Phase 1 baselines, sends
+      consolidated Telegram digests, batch-inserts `alert_logs`, and closes the DB connection.
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import logging
 import random
+import signal
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
-from src.alerts import dispatch_destination_digest, evaluate_slot_alert_triggers
+from src.alerts import (
+    _is_slot_future_release,
+    evaluate_slot_alert_triggers,
+    format_consolidated_destination_digest,
+    send_telegram_message,
+)
 from src.config import (
     DEFAULT_GL,
+    DEFAULT_GL_POOL,
+    DUE_GRACE_MINUTES,
     MAX_SLOTS_PER_RUN,
     get_proxy_account,
     get_proxy_pool,
     get_proxy_tier,
+    parse_gl_pool,
     redact_account_for_log,
     redact_proxy_for_log,
     sanitize_log_text,
 )
 from src.db import (
-    fetch_due_date_slots,
+    assign_destinations_to_shard,
+    close_db_connection,
+    fetch_shard_due_work_package,
+    flush_shard_results_batch,
     init_db,
-    record_price_snapshot,
-    touch_slot_checked,
+    record_alerts_batch,
 )
 from src.scraper import (
     PooledPatchrightSession,
     SlotScrapeResult,
+    _effective_result_price,
     _is_proxy_or_tunnel_error,
     _is_quota_or_auth_error,
-    scrape_date_slot,
+    scrape_date_slot_multi_gl,
 )
 
 logger = logging.getLogger("flightpulse.runner")
+
+__all__ = [
+    "ProxyCircuitBreaker",
+    "assign_destinations_to_shard",
+    "run_sharded_dispatcher",
+    "parse_args",
+    "main",
+]
+
+
+class _GracefulShutdown(BaseException):
+    """Internal control-flow signal raised on SIGTERM/SIGINT to flush RAM buffer immediately."""
 
 
 class ProxyCircuitBreaker:
@@ -124,26 +154,47 @@ def run_sharded_dispatcher(
     force_all: bool = False,
     destination_id: Optional[int] = None,
     slot_id: Optional[int] = None,
+    shard_index: int = 0,
+    total_shards: int = 1,
+    dry_run: bool = False,
     progress_callback: Optional[Callable[[int, int, str, Optional[dict[str, Any]]], None]] = None,
 ) -> dict[str, Any]:
     """
-    Execute a sharded anti-ban scraping batch across due `date_slots`,
-    strictly prioritizing Nivel 1 (WARP) -> Nivel 2 (Direct) -> Nivel 3 (Interleaved Proxy Pool).
+    Execute a 3-phase RAM-buffered Multi-GL scraping batch across due `date_slots`
+    for `shard_index` / `total_shards`.
     """
     start_time = time.perf_counter()
-    init_db()
 
-    due_slots = fetch_due_date_slots(
-        max_slots=max_slots,
+    # ==========================================================================
+    # PHASE 1: SINGLE READ & IMMEDIATE DISCONNECT (~1s)
+    # ==========================================================================
+    batch_started_at = datetime.datetime.now(datetime.timezone.utc)
+    init_db()
+    work_pkg = fetch_shard_due_work_package(
+        shard_index=shard_index,
+        total_shards=total_shards,
         force_all=force_all,
+        max_slots=max_slots,
+        due_grace_minutes=DUE_GRACE_MINUTES,
         destination_id=destination_id,
         slot_id=slot_id,
     )
+    close_db_connection()
 
+    due_slots: list[dict[str, Any]] = work_pkg["due_slots"]
     total_due = len(due_slots)
+    logger.info(
+        "[NEON_SLEEP] Disconnected DB before scraping phase (%d due slots in RAM | shard=%d/%d).",
+        total_due,
+        shard_index,
+        total_shards,
+    )
+
     if total_due == 0:
-        logger.info("No date_slots are currently due for checking.")
+        logger.info("No date_slots are currently due for checking in shard %d/%d.", shard_index, total_shards)
         return {
+            "shard_index": shard_index,
+            "total_shards": total_shards,
             "total_due": 0,
             "scraped_ok": 0,
             "failed": 0,
@@ -156,20 +207,24 @@ def run_sharded_dispatcher(
     # Group selected slots by destination_id while preserving due priority order
     slots_by_dest: dict[int, list[dict[str, Any]]] = collections.OrderedDict()
     dest_meta_map: dict[int, dict[str, Any]] = {}
+    slot_meta_by_id: dict[int, dict[str, Any]] = {}
 
     for slot in due_slots:
+        s_id = int(slot["id"])
         d_id = int(slot["destination_id"])
+        slot_meta_by_id[s_id] = slot
         if d_id not in slots_by_dest:
             slots_by_dest[d_id] = []
+            pool_list = parse_gl_pool(slot.get("gl_pool") or slot.get("gl"), fallback=DEFAULT_GL_POOL)
             dest_meta_map[d_id] = {
                 "id": d_id,
                 "name": slot.get("destination_name"),
                 "origin": slot.get("origin"),
                 "destination": slot.get("destination_code"),
                 "currency": slot.get("currency"),
-                "gl": str(slot.get("gl") or DEFAULT_GL).strip().upper(),
+                "gl": str(slot.get("gl") or pool_list[0]).strip().upper(),
+                "gl_pool": pool_list,
                 "target_price": slot.get("target_price"),
-                "cooldown_hours": slot.get("cooldown_hours"),
                 "filter_config": slot.get("filter_config") or {},
             }
         slots_by_dest[d_id].append(slot)
@@ -183,7 +238,9 @@ def run_sharded_dispatcher(
     current_channel: Optional[str] = channel_chain[active_idx]
 
     logger.info(
-        "Dispatching %d due date_slots across %d destination(s) | primary=(%s, %s) | pool_len=%d.",
+        "Shard %d/%d dispatching %d due date_slots across %d destination(s) | primary=(%s, %s) | pool_len=%d.",
+        shard_index,
+        total_shards,
         total_due,
         len(slots_by_dest),
         get_proxy_tier(current_channel),
@@ -196,6 +253,9 @@ def run_sharded_dispatcher(
     alerts_sent = 0
     processed_count = 0
     detailed_results: list[dict[str, Any]] = []
+    detailed_by_slot_id: dict[int, dict[str, Any]] = {}
+    ram_results: list[dict[str, Any]] = []
+    ram_failed_slot_ids: list[int] = []
 
     def _advance_channel(current_pos: int) -> tuple[int, Optional[str], bool]:
         for next_idx in range(current_pos + 1, len(channel_chain)):
@@ -203,6 +263,28 @@ def run_sharded_dispatcher(
             if breaker.is_available(cand):
                 return next_idx, cand, True
         return current_pos, None, False
+
+    # ==========================================================================
+    # PHASE 2: 100% IN-RAM MULTI-GL SCRAPING (ZERO DB CALLS)
+    # ==========================================================================
+    is_main_thread = threading.current_thread() is threading.main_thread()
+    prev_sigterm: Any = None
+    prev_sigint: Any = None
+    interrupted = False
+
+    def _signal_handler(signum: int, frame: Any) -> None:
+        logger.warning(
+            "Received signal %d during Phase 2 scraping; aborting loop to flush %d RAM result(s).",
+            signum,
+            len(ram_results),
+        )
+        raise _GracefulShutdown()
+
+    if is_main_thread:
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        prev_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
 
     session: Optional[PooledPatchrightSession] = None
     try:
@@ -238,14 +320,15 @@ def run_sharded_dispatcher(
                 session.reset_for_new_destination()
 
             dest_meta = dest_meta_map[d_id]
-            triggered_for_dest: list[dict[str, Any]] = []
+            dest_gl_pool: list[str] = dest_meta["gl_pool"]
 
             logger.info(
-                "Scraping destination [%d] %s (%s -> %s): %d due slot(s) via (%s, %s)",
+                "Scraping destination [%d] %s (%s -> %s, gl_pool=%s): %d due slot(s) via (%s, %s)",
                 d_id,
                 dest_meta.get("name"),
                 dest_meta.get("origin"),
                 dest_meta.get("destination"),
+                ",".join(dest_gl_pool),
                 len(dest_slots),
                 get_proxy_tier(current_channel),
                 redact_proxy_for_log(current_channel),
@@ -269,21 +352,22 @@ def run_sharded_dispatcher(
                 used_channel: Optional[str] = current_channel
 
                 try:
-                    scrape_res = scrape_date_slot(
+                    scrape_res = scrape_date_slot_multi_gl(
                         url=url,
+                        gl_pool=dest_gl_pool,
                         pooled_session=session,
                         proxy_url=current_channel,
                         date_range_label=date_range_label,
-                        gl=dest_meta.get("gl"),
                     )
                     if session is not None and session.proxy_url != current_channel:
-                        # Session switched in-place (e.g. proxy -> direct)
                         breaker.record_failure(current_channel, "proxy_switched_to_direct")
                         current_channel = session.proxy_url
                         used_channel = current_channel
+                except (_GracefulShutdown, KeyboardInterrupt):
+                    raise
                 except Exception as slot_exc:
                     logger.warning(
-                        "[%s] Slot id=%d scrape failed on (%s, %s): %s",
+                        "[%s] Slot id=%d Multi-GL scrape failed on (%s, %s): %s",
                         date_range_label,
                         s_id,
                         get_proxy_tier(current_channel),
@@ -292,8 +376,10 @@ def run_sharded_dispatcher(
                     )
                     breaker.record_failure(current_channel, slot_exc)
 
+                eff_price = _effective_result_price(scrape_res)
+
                 # If current channel failed to return prices, escalate once to next non-exhausted channel
-                if (scrape_res is None or scrape_res.cheapest_tab_price <= 0) and len(channel_chain) > 1:
+                if (scrape_res is None or eff_price is None or eff_price <= 0) and len(channel_chain) > 1:
                     nxt_idx, nxt_ch, ok_adv = _advance_channel(active_idx)
                     if ok_adv:
                         logger.info(
@@ -312,18 +398,21 @@ def run_sharded_dispatcher(
                         current_channel = nxt_ch
                         try:
                             session = PooledPatchrightSession(proxy_url=current_channel).start()
-                            scrape_res = scrape_date_slot(
+                            scrape_res = scrape_date_slot_multi_gl(
                                 url=url,
+                                gl_pool=dest_gl_pool,
                                 pooled_session=session,
                                 proxy_url=current_channel,
                                 date_range_label=date_range_label,
-                                gl=dest_meta.get("gl"),
                             )
                             used_channel = session.proxy_url if session is not None else current_channel
+                            eff_price = _effective_result_price(scrape_res)
+                        except (_GracefulShutdown, KeyboardInterrupt):
+                            raise
                         except Exception as esc_exc:
                             breaker.record_failure(current_channel, esc_exc)
                             logger.warning(
-                                "[%s] Escalated scrape failed for slot id=%d: %s",
+                                "[%s] Escalated Multi-GL scrape failed for slot id=%d: %s",
                                 date_range_label,
                                 s_id,
                                 sanitize_log_text(esc_exc),
@@ -331,41 +420,45 @@ def run_sharded_dispatcher(
 
                 processed_count += 1
 
-                if scrape_res is not None and scrape_res.cheapest_tab_price > 0:
+                if scrape_res is not None and eff_price is not None and eff_price > 0:
                     scraped_ok += 1
                     breaker.record_success(used_channel)
                     tier_key = (get_proxy_tier(used_channel), redact_account_for_log(get_proxy_account(used_channel)))
                     tier_telemetry[tier_key] += 1
 
-                    res_dict = scrape_res.to_dict()
-                    snap_stats = record_price_snapshot(
-                        date_slot_id=s_id,
-                        destination_id=d_id,
-                        cheapest_tab_price=scrape_res.cheapest_tab_price,
-                        best_tab_price=scrape_res.best_tab_price,
-                        cheapest_airline=scrape_res.cheapest_airline,
-                        cheapest_stops=scrape_res.cheapest_stops,
-                        cheapest_duration=scrape_res.cheapest_duration,
-                        cheapest_dep_arr=scrape_res.cheapest_dep_arr,
-                        origin_airport=scrape_res.origin_airport,
-                        destination_airport=scrape_res.destination_airport,
-                        best_airline=scrape_res.best_airline,
-                        best_stops=scrape_res.best_stops,
-                        best_duration=scrape_res.best_duration,
-                        best_origin_airport=scrape_res.best_origin_airport,
-                        best_destination_airport=scrape_res.best_destination_airport,
-                        is_self_transfer=scrape_res.is_self_transfer,
-                        extraction_source=scrape_res.extraction_source,
-                        raw_top_offers=scrape_res.raw_top_offers,
-                    )
+                    winning_gl = str(
+                        scrape_res.winning_gl or scrape_res.gl or dest_meta["gl"] or DEFAULT_GL
+                    ).strip().upper()
+                    scraped_at_ts = datetime.datetime.now(datetime.timezone.utc)
 
-                    trigger_info = evaluate_slot_alert_triggers(
-                        slot_meta=slot,
-                        scrape_result=res_dict,
-                        snapshot_stats=snap_stats,
+                    res_dict = scrape_res.to_dict()
+                    res_dict["winning_gl"] = winning_gl
+
+                    ram_results.append(
+                        {
+                            "date_slot_id": s_id,
+                            "destination_id": d_id,
+                            "scraped_at": scraped_at_ts,
+                            "cheapest_tab_price": float(eff_price),
+                            "best_tab_price": scrape_res.best_tab_price,
+                            "cheapest_airline": scrape_res.cheapest_airline,
+                            "cheapest_stops": scrape_res.cheapest_stops,
+                            "cheapest_duration": scrape_res.cheapest_duration,
+                            "cheapest_dep_arr": scrape_res.cheapest_dep_arr,
+                            "origin_airport": scrape_res.origin_airport,
+                            "destination_airport": scrape_res.destination_airport,
+                            "best_airline": scrape_res.best_airline,
+                            "best_stops": scrape_res.best_stops,
+                            "best_duration": scrape_res.best_duration,
+                            "best_origin_airport": scrape_res.best_origin_airport,
+                            "best_destination_airport": scrape_res.best_destination_airport,
+                            "is_self_transfer": scrape_res.is_self_transfer,
+                            "winning_gl": winning_gl,
+                            "extraction_source": scrape_res.extraction_source,
+                            "raw_top_offers": scrape_res.raw_top_offers,
+                            "scrape_dict": res_dict,
+                        }
                     )
-                    if trigger_info is not None:
-                        triggered_for_dest.append(trigger_info)
 
                     winning_route = (
                         f"{scrape_res.origin_airport}->{scrape_res.destination_airport}"
@@ -380,10 +473,11 @@ def run_sharded_dispatcher(
                         "outbound_date": slot.get("outbound_date"),
                         "return_date": slot.get("return_date"),
                         "status": "OK",
+                        "winning_gl": winning_gl,
                         "winning_route": winning_route,
                         "origin_airport": scrape_res.origin_airport,
                         "destination_airport": scrape_res.destination_airport,
-                        "cheapest_tab_price": scrape_res.cheapest_tab_price,
+                        "cheapest_tab_price": float(eff_price),
                         "best_tab_price": scrape_res.best_tab_price,
                         "cheapest_airline": scrape_res.cheapest_airline,
                         "cheapest_stops": scrape_res.cheapest_stops,
@@ -393,22 +487,23 @@ def run_sharded_dispatcher(
                         "cheapest_tab_status": scrape_res.cheapest_tab_status,
                         "network_tier": tier_key[0],
                         "network_channel": tier_key[1],
-                        "triggered_alert": trigger_info is not None,
+                        "triggered_alert": False,
                     }
                     detailed_results.append(item_summary)
+                    detailed_by_slot_id[s_id] = item_summary
 
                     if progress_callback:
                         progress_callback(
                             processed_count,
                             total_due,
-                            f"Completado {s_label}: Más Barato ${scrape_res.cheapest_tab_price:,.0f} | Mejor ${scrape_res.best_tab_price or scrape_res.cheapest_tab_price:,.0f}",
+                            f"Completado {s_label} ({winning_gl}): Más Barato ${eff_price:,.0f} | Mejor ${(scrape_res.best_tab_price or eff_price):,.0f}",
                             item_summary,
                         )
                 else:
                     failed += 1
                     tier_key = (get_proxy_tier(used_channel), f"{redact_account_for_log(get_proxy_account(used_channel))}_failed")
                     tier_telemetry[tier_key] += 1
-                    touch_slot_checked(s_id)
+                    ram_failed_slot_ids.append(s_id)
                     fail_summary = {
                         "slot_id": s_id,
                         "destination_id": d_id,
@@ -417,6 +512,7 @@ def run_sharded_dispatcher(
                         "outbound_date": slot.get("outbound_date"),
                         "return_date": slot.get("return_date"),
                         "status": "FAILED",
+                        "winning_gl": None,
                         "cheapest_tab_price": None,
                         "best_tab_price": None,
                         "extraction_source": "failed",
@@ -437,34 +533,119 @@ def run_sharded_dispatcher(
                 # Anti-ban jitter between date slots
                 if slot_idx < len(dest_slots) - 1:
                     time.sleep(random.uniform(2.5, 4.5))
-
-            if triggered_for_dest:
-                sent = dispatch_destination_digest(
-                    destination_meta=dest_meta,
-                    triggered_slots=triggered_for_dest,
-                )
-                if sent:
-                    alerts_sent += 1
+    except (_GracefulShutdown, KeyboardInterrupt):
+        interrupted = True
+        logger.warning("Phase 2 interrupted; flushing %d buffered RAM results before exit.", len(ram_results))
     finally:
+        if is_main_thread:
+            try:
+                if prev_sigterm is not None:
+                    signal.signal(signal.SIGTERM, prev_sigterm)
+                if prev_sigint is not None:
+                    signal.signal(signal.SIGINT, prev_sigint)
+            except Exception:
+                pass
         if session is not None:
             session.close()
+
+        # ======================================================================
+        # PHASE 3: ATOMIC BATCH FLUSH + CONSOLIDATED ALERTS + CLOSE (~2s)
+        # ======================================================================
+        try:
+            if not dry_run and (ram_results or ram_failed_slot_ids):
+                flush_stats = flush_shard_results_batch(
+                    ram_results=ram_results,
+                    batch_started_at=batch_started_at,
+                    failed_slot_ids=ram_failed_slot_ids,
+                )
+                logger.info(
+                    "[NEON_FLUSH] Batch flushed: snapshots=%d, slots_updated=%d, failed_touched=%d",
+                    flush_stats["snapshots_inserted"],
+                    flush_stats["slots_updated"],
+                    flush_stats["failed_touched"],
+                )
+
+                results_by_dest: dict[int, list[dict[str, Any]]] = collections.OrderedDict()
+                for item in ram_results:
+                    results_by_dest.setdefault(int(item["destination_id"]), []).append(item)
+
+                sent_alert_batches: list[dict[str, Any]] = []
+                for d_id, dest_ram_items in results_by_dest.items():
+                    dest_meta = dest_meta_map[d_id]
+                    triggered_for_dest: list[dict[str, Any]] = []
+
+                    for item in dest_ram_items:
+                        s_id = int(item["date_slot_id"])
+                        slot_meta = slot_meta_by_id[s_id]
+                        baseline_stats = {
+                            "historical_min_price": slot_meta.get("historical_min_price"),
+                            "last_alerted_at": slot_meta.get("last_alerted_at"),
+                            "last_alerted_price": slot_meta.get("last_alerted_price"),
+                            "prev_effective_price": slot_meta.get("prev_effective_price"),
+                            "last_atl_alerted_price": slot_meta.get("last_atl_alerted_price"),
+                        }
+                        trig = evaluate_slot_alert_triggers(
+                            slot_meta=slot_meta,
+                            scrape_result=item["scrape_dict"],
+                            snapshot_stats=baseline_stats,
+                        )
+                        if trig is not None:
+                            triggered_for_dest.append(trig)
+                            if s_id in detailed_by_slot_id:
+                                detailed_by_slot_id[s_id]["triggered_alert"] = True
+
+                    eligible_slots = [s for s in triggered_for_dest if not _is_slot_future_release(s)]
+                    if eligible_slots:
+                        msg_html = format_consolidated_destination_digest(
+                            destination_meta=dest_meta,
+                            triggered_slots=eligible_slots,
+                            is_test=False,
+                        )
+                        if msg_html:
+                            sent_ok, status_detail = send_telegram_message(msg_html)
+                            if sent_ok:
+                                alerts_sent += 1
+                                sent_alert_batches.append(
+                                    {
+                                        "destination_id": d_id,
+                                        "triggered_slots": eligible_slots,
+                                        "message_preview": msg_html,
+                                    }
+                                )
+                            else:
+                                logger.error(
+                                    "Failed to send Telegram digest for destination_id=%d: %s",
+                                    d_id,
+                                    status_detail,
+                                )
+
+                if sent_alert_batches:
+                    record_alerts_batch(sent_alert_batches)
+        finally:
+            close_db_connection()
 
     elapsed = round(time.perf_counter() - start_time, 2)
     telemetry_dict = {f"{tier}:{ch}": cnt for (tier, ch), cnt in sorted(tier_telemetry.items())}
     logger.info(
-        "Batch finished in %.2fs | Due: %d | OK: %d | Failed: %d | Alerts: %d | Telemetry: %s",
+        "Shard %d/%d finished in %.2fs | Due: %d | OK: %d | Failed: %d | Alerts: %d | Interrupted: %s | Telemetry: %s",
+        shard_index,
+        total_shards,
         elapsed,
         total_due,
         scraped_ok,
         failed,
         alerts_sent,
+        interrupted,
         telemetry_dict,
     )
     return {
+        "shard_index": shard_index,
+        "total_shards": total_shards,
         "total_due": total_due,
         "scraped_ok": scraped_ok,
         "failed": failed,
         "alerts_sent": alerts_sent,
+        "interrupted": interrupted,
         "elapsed_seconds": elapsed,
         "tier_telemetry": telemetry_dict,
         "exhausted_accounts": sorted(redact_account_for_log(a) for a in breaker.exhausted_accounts),
@@ -474,13 +655,13 @@ def run_sharded_dispatcher(
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FlightPulse Matrix v4.0 — Sharded Anti-Ban Queue Dispatcher"
+        description="FlightPulse Matrix v5.0 — 6-Shard Multi-GL RAM-Buffered Queue Dispatcher"
     )
     parser.add_argument(
         "--max-slots",
         type=int,
         default=MAX_SLOTS_PER_RUN,
-        help=f"Maximum number of due date_slots to process in this run (default: {MAX_SLOTS_PER_RUN})",
+        help=f"Maximum number of due date_slots to process in this shard (default: {MAX_SLOTS_PER_RUN})",
     )
     parser.add_argument(
         "--force-all",
@@ -500,6 +681,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Only check a single specific date_slot ID",
     )
     parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="0-based index of this runner shard (default: 0)",
+    )
+    parser.add_argument(
+        "--total-shards",
+        type=int,
+        default=1,
+        help="Total number of parallel shards (default: 1; GitHub Actions matrix uses 6)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run scraping without writing to Neon DB or sending Telegram alerts",
+    )
+    parser.add_argument(
         "--init-db-only",
         action="store_true",
         help="Initialize PostgreSQL tables/indexes and exit without scraping",
@@ -511,6 +709,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     if args.init_db_only:
         init_db()
+        close_db_connection()
         return 0
 
     summary = run_sharded_dispatcher(
@@ -518,6 +717,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         force_all=args.force_all,
         destination_id=args.destination_id,
         slot_id=args.slot_id,
+        shard_index=args.shard_index,
+        total_shards=args.total_shards,
+        dry_run=args.dry_run,
     )
     if summary["total_due"] > 0 and summary["scraped_ok"] == 0:
         logger.error("All %d attempted date slots failed to return prices.", summary["total_due"])
