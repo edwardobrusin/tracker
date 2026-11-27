@@ -1969,6 +1969,146 @@ def bench_28_ram_buffer_neon_sleep_and_flush() -> None:
     measure("28. integration_ram_buffer_flush", _ram_buffer_test)
 
 
+def bench_29_neon_retry_and_idempotent_flush() -> None:
+    """Verify transient Neon SSL OperationalError triggers close+retry and idempotent snapshot insert avoids duplicates."""
+    def _neon_retry_test() -> str:
+        import psycopg as _psycopg
+        import src.db as _db_mod
+
+        init_db()
+        unique_name = f"__NeonRetryTest_{int(time.time() * 1000)}"
+        temp_dest_id: Optional[int] = None
+
+        orig_get_conn = _db_mod.get_connection
+        orig_close_conn = _db_mod.close_db_connection
+        orig_sleep = _db_mod.time.sleep
+
+        try:
+            temp_dest_id = create_destination(
+                name=unique_name,
+                origin="MEX",
+                destination="MXP",
+                target_price=16500.0,
+                gl_pool=["MX", "IT", "DE"],
+                is_active=False,
+            )
+            today = datetime.date.today()
+            out_d = (today + datetime.timedelta(days=45)).strftime("%Y-%m-%d")
+            ret_d = (today + datetime.timedelta(days=55)).strftime("%Y-%m-%d")
+            slot_ids = bulk_create_date_slots(
+                temp_dest_id,
+                [
+                    {
+                        "label": format_date_slot_label(out_d, ret_d),
+                        "outbound_date": out_d,
+                        "return_date": ret_d,
+                        "google_flights_url": build_google_flights_url("MEX", "MXP", out_d, ret_d),
+                    }
+                ],
+            )
+            slot_id = slot_ids[0]
+            batch_ts = datetime.datetime.now(datetime.timezone.utc)
+            snap_ts = batch_ts - datetime.timedelta(seconds=3)
+            ram_item = {
+                "date_slot_id": slot_id,
+                "destination_id": temp_dest_id,
+                "scraped_at": snap_ts,
+                "cheapest_tab_price": 15953.0,
+                "best_tab_price": 18052.0,
+                "cheapest_airline": "Air Canada",
+                "cheapest_stops": "2 escalas",
+                "cheapest_duration": "38 h 25 min",
+                "cheapest_dep_arr": "11:55 - 10:20",
+                "origin_airport": "MEX",
+                "destination_airport": "MXP",
+                "best_airline": "Lufthansa",
+                "best_stops": "1 escala",
+                "best_duration": "15 h 10 min",
+                "best_origin_airport": "MEX",
+                "best_destination_airport": "MXP",
+                "is_self_transfer": False,
+                "winning_gl": "IT",
+                "extraction_source": "patchright_dom",
+                "raw_top_offers": [],
+            }
+
+            close_calls = {"count": 0}
+            sleep_delays: list[float] = []
+            commit_attempts = {"count": 0}
+
+            class _FlakyCommitConn:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                def cursor(self, *args: Any, **kwargs: Any) -> Any:
+                    return self._inner.cursor(*args, **kwargs)
+
+                def commit(self) -> None:
+                    commit_attempts["count"] += 1
+                    if commit_attempts["count"] == 1:
+                        # Simulate Neon SSL connection drop right at COMMIT (even after SQL ran)
+                        self._inner.rollback()
+                        raise _psycopg.OperationalError(
+                            "consuming input failed: SSL connection has been closed unexpectedly"
+                        )
+                    self._inner.commit()
+
+                def rollback(self) -> None:
+                    self._inner.rollback()
+
+                def __enter__(self) -> "_FlakyCommitConn":
+                    self._inner.__enter__()
+                    return self
+
+                def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Any:
+                    return self._inner.__exit__(exc_type, exc_val, exc_tb)
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+            def _wrapped_get_conn(*args: Any, **kwargs: Any) -> Any:
+                return _FlakyCommitConn(orig_get_conn(*args, **kwargs))
+
+            def _wrapped_close() -> None:
+                close_calls["count"] += 1
+                orig_close_conn()
+
+            _db_mod.get_connection = _wrapped_get_conn  # type: ignore[assignment]
+            _db_mod.close_db_connection = _wrapped_close  # type: ignore[assignment]
+            _db_mod.time.sleep = lambda s: sleep_delays.append(float(s))  # type: ignore[assignment]
+
+            flush_out = flush_shard_results_batch([ram_item], batch_started_at=batch_ts)
+            assert flush_out["snapshots_inserted"] == 1
+            assert commit_attempts["count"] == 2, f"Expected 2 commit attempts, got {commit_attempts['count']}"
+            assert close_calls["count"] >= 1, "close_db_connection() must be called on transient SSL failure"
+            assert sleep_delays == [2.0], f"Expected [2.0]s backoff on first retry, got {sleep_delays}"
+
+            # Restore normal get_connection and re-run flush with identical (date_slot_id, scraped_at)
+            # to prove idempotent INSERT never creates duplicate price_snapshots even if attempt 1 actually committed.
+            _db_mod.get_connection = orig_get_conn
+            flush_shard_results_batch([ram_item], batch_started_at=batch_ts)
+
+            with orig_get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM price_snapshots WHERE date_slot_id = %s;",
+                        (slot_id,),
+                    )
+                    cnt = int((cur.fetchone() or {}).get("c") or 0)
+                    assert cnt == 1, f"Expected exactly 1 idempotent price_snapshot row, got {cnt}"
+        finally:
+            _db_mod.get_connection = orig_get_conn
+            _db_mod.close_db_connection = orig_close_conn
+            _db_mod.time.sleep = orig_sleep
+            if temp_dest_id is not None:
+                delete_destination(temp_dest_id)
+            close_db_connection()
+
+        return "SSL OperationalError retry (2s backoff + close) & idempotent snapshot flush OK"
+
+    measure("29. unit_neon_retry_idempotent_flush", _neon_retry_test)
+
+
 def print_summary_table() -> None:
     print("\n" + "=" * 108)
     print(f"{'ACTION':<38} | {'TIME (ms)':>10} | {'SQL':>5} | {'CONNS':>5} | {'STATUS':<6} | {'DETAIL'}")
@@ -2011,6 +2151,7 @@ def main() -> int:
     bench_26_sharding_6_shards_and_10_destinations()
     bench_27_multi_gl_competition_and_tiebreak()
     bench_28_ram_buffer_neon_sleep_and_flush()
+    bench_29_neon_retry_and_idempotent_flush()
     print_summary_table()
     return 0
 
