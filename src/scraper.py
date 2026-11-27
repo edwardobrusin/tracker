@@ -51,6 +51,7 @@ from src.config import (
 )
 from src.ds1_parser import (
     FlightOffer,
+    detect_foreign_currency_in_text,
     detect_self_transfer,
     extract_ds1_currency_from_html,
     parse_ds1_from_html,
@@ -121,16 +122,23 @@ def format_playwright_proxy(proxy_url: Optional[str]) -> Optional[dict[str, str]
         return {"server": proxy_url}
 
 
-def parse_tab_hint_price(aria_label: str = "", text: str = "") -> Optional[float]:
+def parse_tab_hint_price(
+    aria_label: str = "",
+    text: str = "",
+    expected_currency: Optional[str] = None,
+) -> Optional[float]:
     """
     Extract the numeric price announced in the Google Flights 'Los más bajos' tab header
     (e.g. `aria-label="19236 pesos mexicanos"` or `"19.236\\xa0MXN"` -> `19236.0`).
+    Rejects any hint carrying foreign currency markers when `expected_currency` is set.
     """
+    if expected_currency and detect_foreign_currency_in_text(f"{aria_label or ''} {text or ''}", expected_currency):
+        return None
     for candidate in (aria_label or "", text or ""):
         clean = str(candidate).strip()
         if not clean:
             continue
-        parsed = parse_price_number(clean)
+        parsed = parse_price_number(clean, expected_currency=expected_currency)
         if parsed is not None and parsed > 0:
             return parsed
         # Fallback for bare numeric aria-labels or strings without currency suffix
@@ -295,18 +303,28 @@ def evaluate_direct_cheapest_state(
     return False, "waiting_confirm_stability"
 
 
-def _extract_dom_min_from_samples(card_samples: list[dict[str, Any]]) -> Optional[float]:
-    """Return minimum positive price parsed from probe `cardSamples`."""
+def _extract_dom_min_from_samples(
+    card_samples: list[dict[str, Any]],
+    expected_currency: Optional[str] = None,
+) -> Optional[float]:
+    """Return minimum positive price parsed from probe `cardSamples` matching `expected_currency`."""
     prices: list[float] = []
     for cs in card_samples or []:
+        aria_txt = str(cs.get("aria") or "")
+        price_nodes = cs.get("priceNodes") or []
+        if expected_currency and detect_foreign_currency_in_text(
+            f"{aria_txt} {' '.join(str(x) for x in price_nodes)}",
+            expected_currency,
+        ):
+            continue
         p_val: Optional[float] = None
-        for p_txt in cs.get("priceNodes") or []:
-            cand = parse_price_number(p_txt)
+        for p_txt in price_nodes:
+            cand = parse_price_number(p_txt, expected_currency=expected_currency)
             if cand is not None:
                 p_val = cand
                 break
-        if p_val is None and cs.get("aria"):
-            p_val = parse_price_number(cs["aria"])
+        if p_val is None and aria_txt:
+            p_val = parse_price_number(aria_txt, expected_currency=expected_currency)
         if p_val is not None and p_val > 0:
             prices.append(p_val)
     return min(prices) if prices else None
@@ -949,11 +967,19 @@ class PooledPatchrightSession:
             last_active_loaders = active_loaders
             cards_count = int(probe.get("cardsCount") or 0)
 
-            hp = parse_tab_hint_price(probe.get("tabHintAria", ""), probe.get("tabHintText", ""))
+            expected_currency = getattr(self, "_active_expected_currency", None)
+            hp = parse_tab_hint_price(
+                probe.get("tabHintAria", ""),
+                probe.get("tabHintText", ""),
+                expected_currency=expected_currency,
+            )
             if hp is not None and hp > 0:
                 last_tab_hint = hp
 
-            dom_min_price = _extract_dom_min_from_samples(probe.get("cardSamples") or [])
+            dom_min_price = _extract_dom_min_from_samples(
+                probe.get("cardSamples") or [],
+                expected_currency=expected_currency,
+            )
 
             # If a route has no tab bar after >=5s, do not block forever on missing tabFound
             effective_aria_selected = aria_selected or (not tab_found and wait_elapsed >= 5.0)
@@ -1022,10 +1048,77 @@ class PooledPatchrightSession:
         except Exception:
             pass
 
+    def _detect_page_currency_mismatch(
+        self,
+        page: Any,
+        html_content: str,
+        expected_curr: str,
+    ) -> Optional[str]:
+        """
+        Verify that the rendered Google Flights page, final URL `curr=` query param,
+        footer/currency picker, visible card `aria-label`/price nodes, `span[data-gs]`,
+        and `ds:1` booking token all match `expected_curr`.
+        Returns the conflicting currency code if mismatched, else None.
+        """
+        exp = (expected_curr or DEFAULT_CURRENCY).strip().upper()
+        try:
+            cur_url = str(getattr(page, "url", "") or "")
+            if cur_url and "curr=" in cur_url:
+                url_curr = (parse_qs(urlparse(cur_url).query).get("curr", [""])[0] or "").strip().upper()
+                if url_curr and url_curr != exp:
+                    return url_curr
+        except Exception:
+            pass
+
+        try:
+            dom_probe = page.evaluate(
+                """() => {
+                    const footerTexts = Array.from(
+                        document.querySelectorAll('footer button, button[aria-label*="Moneda"], button[aria-label*="Currency"], [data-currency]')
+                    ).map(el => (el.getAttribute('data-currency') || el.getAttribute('aria-label') || el.innerText || '').trim()).filter(Boolean);
+
+                    const cards = Array.from(document.querySelectorAll('li.pIav2d')).slice(0, 5);
+                    const cardTexts = [];
+                    for (const c of cards) {
+                        const aria = c.getAttribute('aria-label') || (c.querySelector('[aria-label]')?.getAttribute('aria-label') || '');
+                        if (aria) cardTexts.push(aria);
+                        for (const n of c.querySelectorAll('.YMlIz, span[data-gs]')) {
+                            const t = (n.textContent || '').trim();
+                            if (t) cardTexts.push(t);
+                            const gs = n.getAttribute('data-gs') || '';
+                            if (gs) cardTexts.push(gs);
+                        }
+                    }
+                    return {
+                        footerText: footerTexts.join(' | '),
+                        cardText: cardTexts.join(' | '),
+                    };
+                }"""
+            )
+            if isinstance(dom_probe, dict):
+                for key in ("footerText", "cardText"):
+                    txt = str(dom_probe.get(key) or "")
+                    if txt:
+                        foreign = detect_foreign_currency_in_text(txt, exp)
+                        if foreign:
+                            return foreign
+        except Exception:
+            pass
+
+        try:
+            ds1_curr = extract_ds1_currency_from_html(html_content)
+            if ds1_curr and ds1_curr != exp:
+                return ds1_curr
+        except Exception:
+            pass
+
+        return None
+
     def _scrape_slot_once(
         self,
         url: str,
         gl: Optional[str] = None,
+        _currency_retry: bool = False,
     ) -> Optional[SlotScrapeResult]:
         """
         Navigate directly to `tfu=EgoIABAAGAAgAigB` (`Los más bajos`), wait deterministically
@@ -1042,6 +1135,8 @@ class PooledPatchrightSession:
         page.set_default_timeout(15000)
         rpc_cheapest_offers: list[FlightOffer] = []
         rpc_payload_counter = {"count": 0}
+        retry_with_explicit_curr = False
+        result_out: Optional[SlotScrapeResult] = None
 
         def _on_response(response: Any) -> None:
             try:
@@ -1127,113 +1222,128 @@ class PooledPatchrightSession:
             # ------------------------------------------------------------------
             # LAYER 2: Deterministic direct-Cheapest settle (loaders == 0)
             # ------------------------------------------------------------------
+            self._active_expected_currency = expected_curr
             cheapest_tab_status, tab_hint_price, active_loaders, tab_clicks, loaders_time_s = (
                 self._wait_for_direct_cheapest_settled(page, t_goto=t_goto, max_wait_s=35.0)
             )
 
-            top_dom_offers, _other_dom_offers, all_dom_offers = self._extract_sectioned_dom_cards(
-                page,
-                max_cards=80,
-                expected_currency=expected_curr,
-            )
-            best_dom_offers = _filter_offers_for_corridor(top_dom_offers, expected_origins, expected_destinations)
-            cheapest_dom_offers = _filter_offers_for_corridor(all_dom_offers, expected_origins, expected_destinations)
-            filtered_rpc_offers = _filter_offers_for_corridor(
-                rpc_cheapest_offers,
-                expected_origins,
-                expected_destinations,
-            )
-            rpc_best = next((o for o in filtered_rpc_offers if o.tab_source == "best"), None)
-
-            sorted_dom_offers: list[FlightOffer] = []
-            sorted_by_price = False
-
-            prelim_min = min(
-                (o.price for o in [*cheapest_dom_offers, *filtered_rpc_offers, *ds1_offers] if o.price > 0),
-                default=None,
-            )
-            # Safety net ONLY if loaders == 0 finished, tab_hint is valid, and cheapest > tab_hint * 1.02
-            if (
-                active_loaders == 0
-                and tab_hint_price is not None
-                and tab_hint_price > 0
-                and (prelim_min is None or prelim_min > tab_hint_price * 1.02)
-            ):
-                sorted_applied, sort_hint, _ = self._sort_results_by_price(
-                    page=page,
-                    tab_hint_price=tab_hint_price,
-                    max_wait_s=12.0,
-                    rpc_payload_counter=rpc_payload_counter,
+            mismatch_curr = self._detect_page_currency_mismatch(page, html_content, expected_curr)
+            if mismatch_curr:
+                logger.warning(
+                    "currency_mismatch: expected=%s, detected=%s, gl=%s",
+                    expected_curr,
+                    mismatch_curr,
+                    gl_eff,
                 )
-                if sort_hint is not None and sort_hint > 0:
-                    tab_hint_price = min(tab_hint_price, sort_hint) if tab_hint_price else sort_hint
-                if sorted_applied:
-                    sorted_by_price = True
-                    _, _, post_sort_all = self._extract_sectioned_dom_cards(
-                        page,
-                        max_cards=80,
-                        expected_currency=expected_curr,
-                    )
-                    sorted_dom_offers = _filter_offers_for_corridor(
-                        post_sort_all, expected_origins, expected_destinations
-                    )
-                    filtered_rpc_offers = _filter_offers_for_corridor(
-                        rpc_cheapest_offers,
-                        expected_origins,
-                        expected_destinations,
-                    )
-                    cheapest_tab_status = "direct_cheapest_sorted_safety_net"
+                if not _currency_retry:
+                    retry_with_explicit_curr = True
+            else:
+                top_dom_offers, _other_dom_offers, all_dom_offers = self._extract_sectioned_dom_cards(
+                    page,
+                    max_cards=80,
+                    expected_currency=expected_curr,
+                )
+                best_dom_offers = _filter_offers_for_corridor(top_dom_offers, expected_origins, expected_destinations)
+                cheapest_dom_offers = _filter_offers_for_corridor(all_dom_offers, expected_origins, expected_destinations)
+                filtered_rpc_offers = _filter_offers_for_corridor(
+                    rpc_cheapest_offers,
+                    expected_origins,
+                    expected_destinations,
+                )
+                rpc_best = next((o for o in filtered_rpc_offers if o.tab_source == "best"), None)
 
-            # ------------------------------------------------------------------
-            # MERGE & SELECT BEST (Top departing flights / ds:1 / RPC) + CHEAPEST
-            # ------------------------------------------------------------------
-            consolidated = consolidate_slot_offers(
-                best_dom_offers=best_dom_offers,
-                cheapest_dom_offers=cheapest_dom_offers,
-                rpc_offers=filtered_rpc_offers,
-                ds1_offers=ds1_offers,
-                ds1_best=ds1_best or rpc_best,
-                expected_origins=expected_origins,
-                expected_destinations=expected_destinations,
-                sorted_dom_offers=sorted_dom_offers,
-            )
-            if not consolidated:
-                return None
+                sorted_dom_offers: list[FlightOffer] = []
+                sorted_by_price = False
 
-            cheapest_offer = consolidated["cheapest_offer"]
-            best_offer = consolidated["best_offer"]
+                prelim_min = min(
+                    (o.price for o in [*cheapest_dom_offers, *filtered_rpc_offers, *ds1_offers] if o.price > 0),
+                    default=None,
+                )
+                # Safety net ONLY if loaders == 0 finished, tab_hint is valid, and cheapest > tab_hint * 1.02
+                if (
+                    active_loaders == 0
+                    and tab_hint_price is not None
+                    and tab_hint_price > 0
+                    and (prelim_min is None or prelim_min > tab_hint_price * 1.02)
+                ):
+                    sorted_applied, sort_hint, _ = self._sort_results_by_price(
+                        page=page,
+                        tab_hint_price=tab_hint_price,
+                        max_wait_s=12.0,
+                        rpc_payload_counter=rpc_payload_counter,
+                    )
+                    if sort_hint is not None and sort_hint > 0:
+                        tab_hint_price = min(tab_hint_price, sort_hint) if tab_hint_price else sort_hint
+                    if sorted_applied:
+                        sorted_by_price = True
+                        _, _, post_sort_all = self._extract_sectioned_dom_cards(
+                            page,
+                            max_cards=80,
+                            expected_currency=expected_curr,
+                        )
+                        sorted_dom_offers = _filter_offers_for_corridor(
+                            post_sort_all, expected_origins, expected_destinations
+                        )
+                        filtered_rpc_offers = _filter_offers_for_corridor(
+                            rpc_cheapest_offers,
+                            expected_origins,
+                            expected_destinations,
+                        )
+                        cheapest_tab_status = "direct_cheapest_sorted_safety_net"
 
-            return SlotScrapeResult(
-                cheapest_tab_price=cheapest_offer.price,
-                cheapest_airline=cheapest_offer.airline,
-                cheapest_stops=cheapest_offer.stops,
-                cheapest_duration=cheapest_offer.duration,
-                cheapest_dep_arr=cheapest_offer.dep_arr,
-                is_self_transfer=cheapest_offer.is_self_transfer,
-                origin_airport=consolidated["c_orig"],
-                destination_airport=consolidated["c_dest"],
-                best_tab_price=best_offer.price if best_offer else cheapest_offer.price,
-                best_airline=best_offer.airline if best_offer else cheapest_offer.airline,
-                best_stops=best_offer.stops if best_offer else cheapest_offer.stops,
-                best_duration=best_offer.duration if best_offer else cheapest_offer.duration,
-                best_origin_airport=consolidated["b_orig"],
-                best_destination_airport=consolidated["b_dest"],
-                extraction_source=consolidated["extraction_source"],
-                cheapest_tab_status=cheapest_tab_status,
-                cheapest_source=consolidated["cheapest_source"],
-                tab_hint_price=tab_hint_price,
-                sorted_by_price=sorted_by_price,
-                tab_clicks=tab_clicks,
-                loaders_time_s=loaders_time_s,
-                gl=gl_eff,
-                winning_gl=gl_eff,
-                raw_top_offers=consolidated["top_3_dicts"],
-            )
+                # ------------------------------------------------------------------
+                # MERGE & SELECT BEST (Top departing flights / ds:1 / RPC) + CHEAPEST
+                # ------------------------------------------------------------------
+                consolidated = consolidate_slot_offers(
+                    best_dom_offers=best_dom_offers,
+                    cheapest_dom_offers=cheapest_dom_offers,
+                    rpc_offers=filtered_rpc_offers,
+                    ds1_offers=ds1_offers,
+                    ds1_best=ds1_best or rpc_best,
+                    expected_origins=expected_origins,
+                    expected_destinations=expected_destinations,
+                    sorted_dom_offers=sorted_dom_offers,
+                )
+                if consolidated:
+                    cheapest_offer = consolidated["cheapest_offer"]
+                    best_offer = consolidated["best_offer"]
+
+                    result_out = SlotScrapeResult(
+                        cheapest_tab_price=cheapest_offer.price,
+                        cheapest_airline=cheapest_offer.airline,
+                        cheapest_stops=cheapest_offer.stops,
+                        cheapest_duration=cheapest_offer.duration,
+                        cheapest_dep_arr=cheapest_offer.dep_arr,
+                        is_self_transfer=cheapest_offer.is_self_transfer,
+                        origin_airport=consolidated["c_orig"],
+                        destination_airport=consolidated["c_dest"],
+                        best_tab_price=best_offer.price if best_offer else cheapest_offer.price,
+                        best_airline=best_offer.airline if best_offer else cheapest_offer.airline,
+                        best_stops=best_offer.stops if best_offer else cheapest_offer.stops,
+                        best_duration=best_offer.duration if best_offer else cheapest_offer.duration,
+                        best_origin_airport=consolidated["b_orig"],
+                        best_destination_airport=consolidated["b_dest"],
+                        extraction_source=consolidated["extraction_source"],
+                        cheapest_tab_status=cheapest_tab_status,
+                        cheapest_source=consolidated["cheapest_source"],
+                        tab_hint_price=tab_hint_price,
+                        sorted_by_price=sorted_by_price,
+                        tab_clicks=tab_clicks,
+                        loaders_time_s=loaders_time_s,
+                        gl=gl_eff,
+                        winning_gl=gl_eff,
+                        raw_top_offers=consolidated["top_3_dicts"],
+                    )
         finally:
+            self._active_expected_currency = None
             try:
                 page.close()
             except Exception:
                 pass
+        if retry_with_explicit_curr:
+            explicit_url = normalize_flights_url(url, tfu=CHEAPEST_TFU, gl=gl_eff, curr=expected_curr)
+            return self._scrape_slot_once(explicit_url, gl=gl_eff, _currency_retry=True)
+        return result_out
 
     def _probe_cheapest_dom_state(self, page: Any) -> dict[str, Any]:
         """
@@ -2477,6 +2587,33 @@ def scrape_date_slot_multi_gl(
                 session_to_use.close()
             except Exception:
                 pass
+
+    # Cross-market anti-currency-leak safety net: discard anomalous low outliers (< 0.30 * median of others)
+    while len(candidates) >= 2:
+        min_item = min(candidates, key=lambda item: (item[2], item[0]))
+        other_prices = sorted(item[2] for item in candidates if item is not min_item)
+        n_other = len(other_prices)
+        mid = n_other // 2
+        others_median = (
+            other_prices[mid]
+            if n_other % 2 == 1
+            else (other_prices[mid - 1] + other_prices[mid]) / 2.0
+        )
+        if others_median > 0 and min_item[2] < 0.30 * others_median:
+            logger.warning(
+                "%smulti_gl_currency_outlier_rejected: gl=%s price=$%s < 0.30 * median_others($%s); discarding candidate.",
+                slot_tag,
+                min_item[1],
+                f"{min_item[2]:,.0f}",
+                f"{others_median:,.0f}",
+            )
+            candidates.remove(min_item)
+            summary_parts = [
+                f"{min_item[1]}=REJECTED_OUTLIER" if p.startswith(f"{min_item[1]}=") else p
+                for p in summary_parts
+            ]
+        else:
+            break
 
     elapsed = time.perf_counter() - start_ts
     if not candidates:

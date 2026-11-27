@@ -492,14 +492,14 @@ def parse_shopping_rpc_response(
 
 
 PRICE_PATTERNS = (
-    # Explicit currency prefix ($14,520, MX$14,520, US$800, €650)
+    # Explicit currency prefix ($14,520, MX$14,520, US$800, €650, £500)
     re.compile(
-        r"(?:MX\$|US\$|\$|EUR|€)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
+        r"(?:MX\$|US\$|CA\$|C\$|\$|EUR|GBP|€|£)\s*(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})(?!\s*(?:kg|CO2|g\b|árboles|h\b|hr|min|m\b|escalas))",
         re.IGNORECASE,
     ),
-    # Explicit currency suffix (14,520 MXN, 31.295 MXN, 14520 pesos, 15959 Mexican pesos)
+    # Explicit currency suffix (14,520 MXN, 31.295 MXN, 784 €, 784 euros, 15959 Mexican pesos, 784 US dollars)
     re.compile(
-        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|COP|CAD|(?:mexican\s+)?pesos(?:\s+mexicanos)?|dólares|dollars)",
+        r"(?<!\d)(\d{1,3}(?:[.,\s\u00a0]\d{3})+|\d{3,7})\s*(?:MXN|USD|EUR|COP|CAD|GBP|€|£|(?:mexican\s+)?pesos(?:\s+mexicanos)?|euros?|(?:US\s+)?dollars?|dólar(?:es)?(?:\s+estadounidenses?)?)",
         re.IGNORECASE,
     ),
     # Formatted thousands with comma or dot (31.295, 14,520) not followed by non-price units
@@ -508,6 +508,36 @@ PRICE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+
+_FOREIGN_CURRENCY_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("EUR", re.compile(r"€|\bEUR\b|\beuros?\b", re.IGNORECASE)),
+    ("USD", re.compile(r"US\$|\bUSD\b|\b(?:US\s+)?dollars?\b|\bdólar(?:es)?(?:\s+estadounidenses?)?\b", re.IGNORECASE)),
+    ("GBP", re.compile(r"£|\bGBP\b|\bpounds?\b|\blibras?\b", re.IGNORECASE)),
+    ("CAD", re.compile(r"CA\$|C\$|\bCAD\b", re.IGNORECASE)),
+    ("COP", re.compile(r"\bCOP\b", re.IGNORECASE)),
+    ("MXN", re.compile(r"MX\$|\bMXN\b|\bpesos?\s+mexicanos?\b|\bmexican\s+pesos?\b", re.IGNORECASE)),
+)
+
+
+def detect_foreign_currency_in_text(
+    text: str,
+    expected_currency: Optional[str],
+) -> Optional[str]:
+    """
+    Inspect text (`aria-label`, card `innerText`, or currency button) for explicit currency
+    indicators that conflict with `expected_currency` (e.g., `€`, `EUR`, `euro`, `euros`,
+    `US$`, `USD`, `US dollars`, `dólares`, `£`, `GBP` when `expected_currency="MXN"`).
+    Returns the conflicting ISO currency code if found, else None.
+    """
+    if not text or not expected_currency:
+        return None
+    exp_curr = expected_currency.strip().upper()
+    if not exp_curr:
+        return None
+    for code, pat in _FOREIGN_CURRENCY_RULES:
+        if code != exp_curr and pat.search(text):
+            return code
+    return None
 
 DURATION_PATTERN = re.compile(
     r"\b(\d{1,2}\s*(?:h|hr|hrs|horas?)(?:\s*\d{1,2}\s*(?:m|min|minutos?)\b)?|\d{1,2}\s*(?:min|minutos?))\b",
@@ -618,12 +648,19 @@ def extract_route_iatas_from_card(
     return None, None
 
 
-def parse_price_number(raw_price_text: str) -> Optional[float]:
+def parse_price_number(
+    raw_price_text: str,
+    expected_currency: Optional[str] = None,
+) -> Optional[float]:
     """
     Parse a price string such as `"$14,520 MXN"`, `"14.520"`, or `"Desde $14,520 MXN"`
-    into a clean float (`14520.0`). Rejects bare years (1900..2100) when no currency token is present.
+    into a clean float (`14520.0`). Rejects bare years (1900..2100) when no currency token is present,
+    and rejects any string carrying indicators of a currency different from `expected_currency`.
     """
     if not raw_price_text:
+        return None
+
+    if expected_currency and detect_foreign_currency_in_text(raw_price_text, expected_currency):
         return None
 
     for idx, pattern in enumerate(PRICE_PATTERNS):
@@ -656,22 +693,20 @@ def parse_flight_card_text(
     """
     Parse a Google Flights DOM flight card (`li.pIav2d` or `[role="listitem"]`)
     combining its semantic `aria-label` and visible `inner_text`.
+    Strictly discards offers containing foreign currency indicators when `expected_currency` is set.
     """
     combined = f"{aria_label or ''} | {inner_text or ''}".strip()
     if not combined or combined == "|":
         return None
 
-    if expected_currency:
-        exp_curr = expected_currency.strip().upper()
-        for foreign_curr in ("MXN", "USD", "EUR", "CAD", "COP", "GBP"):
-            if foreign_curr != exp_curr and re.search(rf"\b{foreign_curr}\b", combined, re.IGNORECASE):
-                return None
-        if exp_curr != "USD" and re.search(r"US\$|dólares estadounidense", combined, re.IGNORECASE):
-            return None
-        if exp_curr != "EUR" and "€" in combined:
-            return None
+    if expected_currency and detect_foreign_currency_in_text(combined, expected_currency):
+        return None
 
-    price = price_override or parse_price_number(aria_label) or parse_price_number(inner_text)
+    price = (
+        price_override
+        or parse_price_number(aria_label, expected_currency=expected_currency)
+        or parse_price_number(inner_text, expected_currency=expected_currency)
+    )
     if price is None or price <= 0:
         return None
 

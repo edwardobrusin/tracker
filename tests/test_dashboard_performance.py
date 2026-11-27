@@ -2109,6 +2109,95 @@ def bench_29_neon_retry_and_idempotent_flush() -> None:
     measure("29. unit_neon_retry_idempotent_flush", _neon_retry_test)
 
 
+def bench_30_currency_shield_and_line_charts() -> None:
+    """Verify strict foreign-currency rejection, Multi-GL outlier filter, curr=MXN URL preservation, and line-only charts."""
+    def _currency_and_chart_test() -> str:
+        import logging as _logging
+        import src.scraper as _scraper_mod
+        from src.tfs_builder import CHEAPEST_TFU, normalize_flights_url
+
+        # 1. Parser rejects €784 / 784 € / 784 euros / US$784 / 784 US dollars when expected_currency="MXN"
+        bad_cards = [
+            ("Desde €784. Vuelo con Iberia. Duración total: 14 h 10 min.", "10:00 – 06:10+1\nIberia\n14 h 10 min\nMEX–MAD\n1 escala\n€784"),
+            ("Desde 784 euros. Vuelo con Iberia. Duración total: 14 h 10 min.", "10:00 – 06:10+1\nIberia\n14 h 10 min\nMEX–MAD\n1 escala\n784 €"),
+            ("From 784 US dollars. Flight with Iberia. Total duration 14 hr 10 min.", "10:00 AM – 6:10 AM+1\nIberia\n14 hr 10 min\nMEX–MAD\n1 stop\nUS$784"),
+            ("Desde 784 dólares. Vuelo con Iberia. Duración total: 14 h 10 min.", "10:00 – 06:10+1\nIberia\n14 h 10 min\nMEX–MAD\n1 escala\n784 USD"),
+        ]
+        for aria, text in bad_cards:
+            assert parse_flight_card_text(aria, text, expected_currency="MXN") is None, f"Must reject foreign card: {aria}"
+            assert parse_price_number(text, expected_currency="MXN") is None, f"Must reject foreign price_number: {text}"
+
+        # Accepts valid MXN formats
+        ok_cards = [
+            ("Desde 15664 pesos mexicanos. Vuelo con Iberia. Duración total: 14 h 10 min.", "10:00 – 06:10+1\nIberia\n14 h 10 min\nMEX–MAD\n1 escala\nMX$15,664", 15664.0),
+            ("From 15664 Mexican pesos. Flight with Iberia. Total duration 14 hr 10 min.", "10:00 AM – 6:10 AM+1\nIberia\n14 hr 10 min\nMEX–MAD\n1 stop\n15.664\xa0MXN", 15664.0),
+        ]
+        for aria, text, exp_p in ok_cards:
+            parsed = parse_flight_card_text(aria, text, expected_currency="MXN")
+            assert parsed is not None and parsed.price == exp_p, f"Must accept MXN card: {aria}"
+
+        # 2. normalize_flights_url always preserves/injects curr=MXN
+        no_curr_url = "https://www.google.com/travel/flights/search?tfs=abc&hl=es"
+        norm_url = normalize_flights_url(no_curr_url, tfu=CHEAPEST_TFU, gl="IT")
+        assert "curr=MXN" in norm_url and "gl=IT" in norm_url and f"tfu={CHEAPEST_TFU}" in norm_url
+
+        # 3. scrape_date_slot_multi_gl discards 784 outlier vs MX=$15,664 and DE=$15,664 -> picks MX=$15,664
+        orig_scrape = _scraper_mod.scrape_date_slot
+        log_msgs: list[str] = []
+
+        class _CapHandler(_logging.Handler):
+            def emit(self, record: _logging.LogRecord) -> None:
+                log_msgs.append(self.format(record))
+
+        h = _CapHandler()
+        _scraper_mod.logger.addHandler(h)
+        prev_lvl = _scraper_mod.logger.level
+        _scraper_mod.logger.setLevel(_logging.WARNING)
+        try:
+            def _make_res(p: float, b: float, gl_code: str) -> SlotScrapeResult:
+                return SlotScrapeResult(
+                    cheapest_tab_price=p,
+                    cheapest_airline="Iberia",
+                    cheapest_stops="1 escala",
+                    cheapest_duration="14 h 10 min",
+                    cheapest_dep_arr="10:00 - 06:10",
+                    is_self_transfer=False,
+                    origin_airport="MEX",
+                    destination_airport="MAD",
+                    best_tab_price=b,
+                    gl=gl_code,
+                    winning_gl=gl_code,
+                )
+
+            mock_prices = {"MX": (15664.0, 16128.0), "IT": (784.0, 809.0), "DE": (15664.0, 16128.0)}
+            _scraper_mod.scrape_date_slot = lambda url, pooled_session=None, proxy_url=None, date_range_label="", gl=None: _make_res(  # type: ignore[assignment]
+                mock_prices[gl][0], mock_prices[gl][1], gl
+            )
+            winner = scrape_date_slot_multi_gl(
+                "https://www.google.com/travel/flights/search?tfs=abc&curr=MXN",
+                gl_pool=("MX", "IT", "DE"),
+                date_range_label="2027-08-20 -> 2027-09-06",
+                inter_gl_delay=(0.0, 0.0),
+            )
+            assert winner is not None
+            assert winner.winning_gl == "MX" and winner.cheapest_tab_price == 15664.0
+            assert any("multi_gl_currency_outlier_rejected" in m for m in log_msgs)
+        finally:
+            _scraper_mod.scrape_date_slot = orig_scrape
+            _scraper_mod.logger.removeHandler(h)
+            _scraper_mod.logger.setLevel(prev_lvl)
+
+        # 4. Verify historical charts in app.py use line-only (no lines+markers or markers=True)
+        app_src = (ROOT_DIR / "app.py").read_text(encoding="utf-8")
+        assert 'mode="lines+markers"' not in app_src, "app.py must not contain mode='lines+markers'"
+        assert "markers=True" not in app_src, "app.py must not contain markers=True"
+        assert 'mode="lines"' in app_src
+
+        return "Foreign currency rejected + 784 Multi-GL outlier discarded + line-only charts OK"
+
+    measure("30. unit_currency_shield_line_charts", _currency_and_chart_test)
+
+
 def print_summary_table() -> None:
     print("\n" + "=" * 108)
     print(f"{'ACTION':<38} | {'TIME (ms)':>10} | {'SQL':>5} | {'CONNS':>5} | {'STATUS':<6} | {'DETAIL'}")
@@ -2152,6 +2241,7 @@ def main() -> int:
     bench_27_multi_gl_competition_and_tiebreak()
     bench_28_ram_buffer_neon_sleep_and_flush()
     bench_29_neon_retry_and_idempotent_flush()
+    bench_30_currency_shield_and_line_charts()
     print_summary_table()
     return 0
 

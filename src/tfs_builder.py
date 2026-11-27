@@ -726,10 +726,12 @@ def normalize_flights_url(
     *,
     tfu: str = CHEAPEST_TFU,
     gl: Optional[str] = None,
+    curr: Optional[str] = None,
 ) -> str:
     """
-    Safely insert or update `tfu` (defaulting to direct Cheapest view `CHEAPEST_TFU`)
-    and optionally `gl` in any Google Flights URL without altering `?tfs=`, `curr`, or `hl`.
+    Safely insert or update `tfu` (defaulting to direct Cheapest view `CHEAPEST_TFU`),
+    optionally `gl`, and guarantee non-empty `curr` (defaulting to `DEFAULT_CURRENCY`)
+    in any Google Flights URL without altering `?tfs=` or `hl`.
     """
     if not url or not str(url).strip():
         raise ValueError("URL cannot be empty")
@@ -748,6 +750,10 @@ def normalize_flights_url(
     flat_params["tfu"] = (tfu or CHEAPEST_TFU).strip()
     if gl is not None and str(gl).strip():
         flat_params["gl"] = str(gl).strip().upper()
+    if curr is not None and str(curr).strip():
+        flat_params["curr"] = str(curr).strip().upper()
+    elif not flat_params.get("curr") or not flat_params["curr"].strip():
+        flat_params["curr"] = DEFAULT_CURRENCY
 
     scheme = parsed.scheme or "https"
     netloc = parsed.netloc or "www.google.com"

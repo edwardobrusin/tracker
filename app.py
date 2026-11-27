@@ -698,20 +698,25 @@ def render_tab1_matrix_explorer() -> None:
         )
 
         if chart_mode.startswith("Evolución Multi-Fecha"):
+            hover_cols = [c for c in ("cheapest_airline", "winning_gl") if c in df_snap.columns]
             fig_multi = px.line(
                 df_snap,
                 x="scraped_at",
                 y="cheapest_tab_price",
                 color="slot_display",
-                markers=True,
+                markers=False,
+                hover_data=hover_cols if hover_cols else None,
                 title=f"Evolución de Tarifas Más Baratas — {dest_for_chart_meta['name']}",
                 labels={
                     "scraped_at": "Fecha de Escaneo",
                     "cheapest_tab_price": f"Precio ({dest_for_chart_meta['currency']})",
                     "slot_display": "Combinación de Fechas",
+                    "cheapest_airline": "Aerolínea",
+                    "winning_gl": "POS",
                 },
                 template="plotly_dark",
             )
+            fig_multi.update_traces(mode="lines")
             if float(dest_for_chart_meta.get("target_price") or 0) > 0:
                 t_val = float(dest_for_chart_meta["target_price"])
                 fig_multi.add_hline(
@@ -745,23 +750,37 @@ def render_tab1_matrix_explorer() -> None:
             if df_slot.empty:
                 st.warning("Esta combinación de fechas aún no tiene snapshots registrados.")
             else:
+                cheap_airlines = (
+                    df_slot["cheapest_airline"].fillna("N/A").tolist()
+                    if "cheapest_airline" in df_slot.columns
+                    else ["N/A"] * len(df_slot)
+                )
+                best_airlines = (
+                    df_slot["best_airline"].fillna("N/A").tolist()
+                    if "best_airline" in df_slot.columns
+                    else cheap_airlines
+                )
                 fig_dual = go.Figure()
                 fig_dual.add_trace(
                     go.Scatter(
                         x=df_slot["scraped_at"],
                         y=df_slot["cheapest_tab_price"],
-                        mode="lines+markers",
+                        mode="lines",
                         name="Más Baratos",
                         line=dict(color="#38BDF8", width=3),
+                        customdata=cheap_airlines,
+                        hovertemplate="%{y:$,.0f} • %{customdata}<extra>Más Baratos</extra>",
                     )
                 )
                 fig_dual.add_trace(
                     go.Scatter(
                         x=df_slot["scraped_at"],
                         y=df_slot["best_tab_price"],
-                        mode="lines+markers",
+                        mode="lines",
                         name="Mejores Vuelos",
                         line=dict(color="#F59E0B", width=2.5, dash="dot"),
+                        customdata=best_airlines,
+                        hovertemplate="%{y:$,.0f} • %{customdata}<extra>Mejores Vuelos</extra>",
                     )
                 )
                 if float(dest_for_chart_meta.get("target_price") or 0) > 0:
